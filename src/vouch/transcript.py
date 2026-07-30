@@ -375,7 +375,7 @@ def parse_codex_transcript(path: Path, *, max_messages: int = 2000) -> dict[str,
 
 
 def _degraded(store: KBStore | None, session_id: str, reason: str) -> dict[str, Any]:
-    # No KB resolved: the raw transcript lives outside `.vouch/`, so the
+    # no kb resolved: the raw transcript lives outside `.vouch/`, so the
     # lookup still answers — there is just no capture buffer to fall back on.
     obs = _read_observations(buffer_path(store, session_id)) if store is not None else []
     return {"available": False, "reason": reason, "observations": obs}
@@ -390,8 +390,8 @@ def load_transcript(
     tried. Returns the normalized schema on success, or a degraded result
     (compact capture observations) when the raw file is missing/too large.
 
-    ``store`` may be None when no KB resolves from the caller's cwd. The raw
-    transcript is read from the agent's own directory, not from the KB, so the
+    ``store`` may be None when no kb resolves from the caller's cwd. the raw
+    transcript is read from the agent's own directory, not from the kb, so the
     normalized result is unaffected; only the degraded path loses its
     observations.
     """

@@ -240,10 +240,37 @@ def test_handler_degrades_when_no_kb_resolves(
 def test_load_transcript_without_store_degrades(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    # with `agent` omitted the locator tries claude *and* codex, so both roots
+    # have to be pointed at empty dirs — isolating only the claude one leaves
+    # an ambient codex rollout able to satisfy the lookup and flip this result.
     monkeypatch.setenv("VOUCH_CLAUDE_PROJECTS_DIR", str(tmp_path / "projects"))
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path / "codex"))
     out = transcript.load_transcript(None, "11111111-1111-1111-1111-111111111111")
     assert out["available"] is False
     assert out["observations"] == []
+
+
+@pytest.mark.parametrize("module_name", ["vouch.jsonl_server", "vouch.server"])
+def test_store_or_none_propagates_non_missing_kb_failures(
+    monkeypatch: pytest.MonkeyPatch, module_name: str
+) -> None:
+    """a broken kb must not be reported as an absent one.
+
+    `_store_or_none` used to catch the `RuntimeError` that `_store()` wraps
+    `KBNotFoundError` in, which is indistinguishable from a malformed-config or
+    permission failure — so a real fault silently degraded to "no kb" and
+    dropped transcript enrichment instead of surfacing.
+    """
+    import importlib
+
+    module = importlib.import_module(module_name)
+
+    def boom(*_args: object, **_kwargs: object) -> Path:
+        raise RuntimeError("config.yaml is unreadable")
+
+    monkeypatch.setattr(module, "discover_root", boom)
+    with pytest.raises(RuntimeError, match="unreadable"):
+        module._store_or_none()
 
 
 def test_mcp_session_transcript_degrades_without_kb(
