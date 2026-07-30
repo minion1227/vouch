@@ -20,6 +20,7 @@ from typing import Any, Literal, cast
 import yaml
 
 from . import graph, hot_memory, index_db, retrieval_events
+from . import pins as pins_mod
 from . import strategy as strategy_mod
 from .config_coerce import coerce_bool
 from .embeddings.fusion import rrf_fuse
@@ -720,6 +721,16 @@ def _jaccard(a: set[str], b: set[str]) -> float:
     return len(a & b) / len(a | b)
 
 
+# The near-duplicate heuristic, shared by the retrieval pass and the pin
+# injection below it so the two cannot drift to different notions of "same".
+_NEAR_DUP_THRESHOLD = 0.85
+_NEAR_DUP_TOKENS = 40
+
+
+def _near_dup_tokens(summary: str) -> set[str]:
+    return set(summary.lower().split()[:_NEAR_DUP_TOKENS])
+
+
 def _dedupe_near_duplicates(items: list[ContextItem]) -> list[ContextItem]:
     """Drop items whose summary is near-identical to a higher-scored one.
 
@@ -736,8 +747,8 @@ def _dedupe_near_duplicates(items: list[ContextItem]) -> list[ContextItem]:
     kept_tokens: list[set[str]] = []
     order = sorted(range(len(items)), key=lambda i: items[i].score, reverse=True)
     for idx in order:
-        toks = set(items[idx].summary.lower().split()[:40])
-        if any(_jaccard(toks, seen) >= 0.85 for seen in kept_tokens):
+        toks = _near_dup_tokens(items[idx].summary)
+        if any(_jaccard(toks, seen) >= _NEAR_DUP_THRESHOLD for seen in kept_tokens):
             dropped.add(idx)
             continue
         kept_tokens.append(toks)
@@ -829,6 +840,36 @@ def build_context_pack(
         )
 
     items = _dedupe_near_duplicates(items)
+
+    # Pins go in front of everything retrieval chose (#615): the working set is
+    # a standing instruction, so it must not have to win the query every turn.
+    # `pinned_items` re-checks lifecycle and viewer scope on every build, so a
+    # pin can reorder the pack but never widen what it may contain. The budget
+    # share caps them, and de-duplication keeps a pinned artifact that also
+    # ranked from occupying two slots.
+    pinned = pins_mod.pinned_items(store, viewer=viewer, max_chars=max_chars)
+    if pinned:
+        # Exact `(type, id)` de-duplication is not enough: the same knowledge
+        # can be stored under a second id, and `_dedupe_near_duplicates` ran
+        # before the pins existed, so a retrieved near-duplicate of a pin has
+        # never been compared against it.
+        #
+        # Deliberately not solved by moving the pass below this injection: it
+        # keeps the *highest-scored* member of a cluster rather than the first,
+        # and `pages_first` multiplies a page's score by `boost` (1.25 by
+        # default), so a retrieved page can outscore a pin's flat 1.0 and evict
+        # it. That is precisely the outcome pinning exists to prevent, so the
+        # comparison runs here instead, where the pin always wins.
+        pinned_keys = {(p.type, p.id) for p in pinned}
+        pinned_tokens = [_near_dup_tokens(p.summary) for p in pinned]
+        items = pinned + [
+            i for i in items
+            if (i.type, i.id) not in pinned_keys
+            and not any(
+                _jaccard(_near_dup_tokens(i.summary), pt) >= _NEAR_DUP_THRESHOLD
+                for pt in pinned_tokens
+            )
+        ]
 
     failed: list[str] = []
     uncited: list[str] = []
