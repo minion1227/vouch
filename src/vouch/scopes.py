@@ -88,6 +88,7 @@ METHOD_SCOPES: dict[str, str] = {
     "kb.list_pending": READ,
     "kb.triage_pending": READ,
     "kb.list_sessions": READ,
+    "kb.list_goals": READ,
     "kb.session_transcript": READ,
     "kb.volunteer_context": READ,
     "kb.lint": READ,
@@ -116,6 +117,11 @@ METHOD_SCOPES: dict[str, str] = {
     "kb.propose_relation": PROPOSE,
     "kb.propose_delete": PROPOSE,
     "kb.propose_theme": PROPOSE,
+    "kb.propose_goal": PROPOSE,
+    # capture_correction routes exclusively through propose_quoted_claim and
+    # has no import of approve — it files a PENDING claim like any other
+    # proposal, so it belongs here and not with the deciding verbs.
+    "kb.capture_correction": PROPOSE,
     "kb.cite": PROPOSE,
     "kb.source_verify": PROPOSE,
     "kb.session_start": PROPOSE,
@@ -134,6 +140,13 @@ METHOD_SCOPES: dict[str, str] = {
     "kb.contradict": APPROVE,
     "kb.archive": APPROVE,
     "kb.confirm": APPROVE,
+    # set_goal_status is a lifecycle op, not a proposal: it mutates an already
+    # approved goal in place (life.set_goal_status, beside supersede/archive/
+    # confirm) and is documented as "the only write path for goal status" —
+    # status moves never go through a second proposal. Filing it under PROPOSE
+    # would let a propose-only credential change durable state with no review,
+    # which is the boundary this module exists to hold.
+    "kb.set_goal_status": APPROVE,
     # --- kb:admin — destructive or index-wide maintenance ------------------
     "kb.clear_claims": ADMIN,
     "kb.wipe_dead_refs": ADMIN,
