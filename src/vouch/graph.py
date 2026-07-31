@@ -10,7 +10,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Literal
 
-from .models import ClaimStatus, Relation
+from .models import ClaimStatus, PageStatus, Relation
 from .storage import ArtifactNotFoundError, KBStore
 
 _RETRACTED_CLAIM_STATUSES = frozenset({
@@ -145,6 +145,13 @@ def _edges_from_node(
 def _neighbor_ok(store: KBStore, node_id: str, kind: NodeKind) -> bool:
     if kind == "claim":
         return _claim_is_retrievable(store, node_id)
+    if kind == "page":
+        # match context._page_is_live — archived pages are out of the live
+        # set, so neighbors must not surface them either (#696).
+        try:
+            return store.get_page(node_id).status is not PageStatus.ARCHIVED
+        except ArtifactNotFoundError:
+            return False
     return store._node_exists(node_id)
 
 

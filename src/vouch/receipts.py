@@ -24,7 +24,7 @@ from __future__ import annotations
 import hashlib
 from dataclasses import dataclass
 from enum import StrEnum
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from .models import Evidence
 
@@ -110,6 +110,7 @@ def receipt_for_quote(
     source_bytes: bytes,
     quote: str,
     evidence_id: str | None = None,
+    coordinates: dict[str, Any] | None = None,
 ) -> Evidence | None:
     """Build an ``Evidence`` carrying a verifying receipt, or None to drop.
 
@@ -118,15 +119,25 @@ def receipt_for_quote(
     Returns None when the quote is not present verbatim — the mechanical form
     of "drops any claim it cannot quote." When ``evidence_id`` is omitted, a
     content-addressed id derived from the span is minted.
+
+    ``coordinates`` is a media source's page/timestamp map (see
+    :mod:`vouch.media`). It only enriches the human-facing ``locator`` — the
+    receipt that verifies is still the byte span, so a media citation is
+    checked by exactly the same string comparison as any other.
     """
     span = locate_span(source_bytes, quote)
     if span is None:
         return None
     start, end = span
+    locator = f"b{start}-{end}"
+    if coordinates:
+        from .media import locator_for_span
+
+        locator = locator_for_span(coordinates, start, end)
     return Evidence(
         id=evidence_id or _span_evidence_id(source_id, start, end),
         source_id=source_id,
-        locator=f"b{start}-{end}",
+        locator=locator,
         quote=quote,
         byte_start=start,
         byte_end=end,

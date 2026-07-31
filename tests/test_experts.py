@@ -14,7 +14,8 @@ import pytest
 
 from vouch.experts import rank_experts
 from vouch.jsonl_server import handle_request
-from vouch.models import Claim, ClaimStatus, Entity, EntityType
+from vouch.models import ArtifactScope, Claim, ClaimStatus, Entity, EntityType, Visibility
+from vouch.scoping import ViewerContext
 from vouch.storage import KBStore
 
 
@@ -125,6 +126,51 @@ def test_deterministic_tie_break_on_entity_id(store: KBStore) -> None:
     ranked = rank_experts(store, "topic-x")
     tied = [r["entity_id"] for r in ranked if r["entity_id"] in {"a1", "a2"}]
     assert tied == ["a1", "a2"]  # equal score -> ascending entity_id
+
+
+def test_scopes_ranking_to_the_viewer(store: KBStore) -> None:
+    """A viewer outside a claim's project must not have that claim inflate
+    claim_count/citation_count/score, and must never see its id surface in
+    top_claim_ids — scoring after filtering, not just scrubbing the id list,
+    is what keeps a mostly-private entity from outranking one the viewer can
+    actually read."""
+    src = store.put_source(b"y")
+    store.put_entity(Entity(id="jwt", name="JWT", type=EntityType.CONCEPT))
+    store.put_entity(Entity(id="alice", name="alice", type=EntityType.PERSON))
+    for i in range(3):
+        store.put_claim(
+            Claim(
+                id=f"priv{i}",
+                text=f"jwt fact {i} by alice",
+                evidence=[src.id],
+                entities=["jwt", "alice"],
+                scope=ArtifactScope(visibility=Visibility.PROJECT, project="secret-project"),
+            )
+        )
+    store.put_claim(
+        Claim(
+            id="pub",
+            text="jwt public fact by alice",
+            evidence=[src.id],
+            entities=["jwt", "alice"],
+            scope=ArtifactScope(visibility=Visibility.PUBLIC),
+        )
+    )
+
+    foreign = ViewerContext(project="other-project", agent=None)
+    rows = rank_experts(store, "JWT", viewer=foreign)
+    alice = next(r for r in rows if r["entity_id"] == "alice")
+    assert alice["claim_count"] == 1
+    assert alice["top_claim_ids"] == ["pub"]
+    for row in rows:
+        assert "priv0" not in row["top_claim_ids"]
+        assert "priv1" not in row["top_claim_ids"]
+        assert "priv2" not in row["top_claim_ids"]
+
+    owner = ViewerContext(project="secret-project", agent=None)
+    owner_rows = rank_experts(store, "JWT", viewer=owner)
+    owner_alice = next(r for r in owner_rows if r["entity_id"] == "alice")
+    assert owner_alice["claim_count"] == 4
 
 
 def test_jsonl_experts_envelope_success(store: KBStore, monkeypatch) -> None:

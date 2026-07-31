@@ -391,3 +391,198 @@ def test_run_scores_every_derivation_category() -> None:
         assert entry["n"] == 1
         assert entry["mean"] is not None
         assert 0.0 <= entry["mean"] <= 1.0
+
+
+# --- composite guards (#616) ----------------------------------------------
+
+
+def test_the_report_carries_a_bench_version() -> None:
+    """The whole compatibility story: a guarded score must not be silently
+    compared to a legacy one."""
+    report = run(1, sessions=3)
+    assert report["bench_version"] == bench.BENCH_VERSION
+    assert bench.BENCH_VERSION >= 2
+
+
+def test_composite_keeps_its_original_meaning() -> None:
+    """`composite` is still the plain mean over category means.
+
+    Every recorded score and ladder entry depends on this. The guards ride
+    beside it in `composite_guarded`, never folded into it.
+    """
+    report = run(1, sessions=3)
+    means = [
+        entry["mean"] for entry in report["categories"].values()
+        if entry["mean"] is not None
+    ]
+    assert report["composite"] == pytest.approx(
+        round(sum(means) / len(means), 4), abs=1e-4
+    )
+
+
+def test_guarded_composite_is_the_product_of_the_guards() -> None:
+    report = run(1, sessions=3)
+    g = report["guards"]
+    assert report["composite_guarded"] == pytest.approx(
+        round(report["composite"] * g["efficiency"] * g["consistency"]
+              * g["canary"], 4),
+        abs=1e-4,
+    )
+
+
+def test_guards_are_reported_separately_not_folded_in() -> None:
+    """An opaque composite is worse than no composite."""
+    report = run(1, sessions=3)
+    for key in ("efficiency", "consistency", "canary", "canary_leak_rate"):
+        assert key in report["guards"]
+
+
+# --- efficiency -----------------------------------------------------------
+
+
+def test_efficiency_penalises_a_fuller_pack() -> None:
+    lean = bench.efficiency_multiplier([100, 120], 2000)
+    fat = bench.efficiency_multiplier([1900, 2000], 2000)
+    assert lean > fat
+
+
+def test_efficiency_is_bounded_below() -> None:
+    """A wasteful run is penalised, never zeroed — this is a tiebreak."""
+    assert bench.efficiency_multiplier([5000], 2000) == bench.GUARD_MIN_EFFICIENCY
+    assert bench.efficiency_multiplier([0], 2000) == 1.0
+
+
+@pytest.mark.parametrize(("used", "budget"), [([], 2000), ([100], 0)])
+def test_efficiency_degrades_to_one_without_data(
+    used: list[int], budget: int
+) -> None:
+    assert bench.efficiency_multiplier(used, budget) == 1.0
+
+
+# --- consistency ----------------------------------------------------------
+
+
+def test_paraphrase_zero_is_the_original() -> None:
+    assert bench.paraphrase("what is the deploy day?", 0) == (
+        "what is the deploy day?"
+    )
+
+
+def test_paraphrases_are_deterministic_and_rewrite_the_question() -> None:
+    """Template-driven: an LLM rewrite would break seed reproducibility."""
+    for i in range(1, 4):
+        first = bench.paraphrase("what is the deploy day?", i)
+        assert first == bench.paraphrase("what is the deploy day?", i)
+        assert first != "what is the deploy day?"
+        assert "what is the deploy day?" in first
+
+
+def test_consistency_counts_agreeing_cases() -> None:
+    assert bench.consistency_multiplier([True, True]) == 1.0
+    assert bench.consistency_multiplier([True, False]) == 0.5
+    assert bench.consistency_multiplier([False]) == 0.0
+    assert bench.consistency_multiplier([]) == 1.0
+
+
+# --- canary ---------------------------------------------------------------
+
+
+def test_canary_halves_only_when_tripped() -> None:
+    assert bench.canary_multiplier(False) == 1.0
+    assert bench.canary_multiplier(True) == bench.CANARY_PENALTY
+
+
+def test_every_seed_plants_a_distinct_canary() -> None:
+    values = {generate(seed).canary for seed in range(1, 6)}
+    assert all(values)
+    assert len(values) == 5
+
+
+def test_the_canary_is_in_the_corpus_but_answers_nothing() -> None:
+    dataset = generate(3)
+    corpus = "\n".join(text for _title, text in dataset.sessions)
+    assert dataset.canary in corpus
+    for case in dataset.cases:
+        assert case.expected != dataset.canary
+        assert dataset.canary not in (case.required or ())
+
+
+def test_canary_shares_no_vocabulary_with_any_question() -> None:
+    """Otherwise the guard measures the generator's word choice, not the ranker.
+
+    A first draft read "the retired access code was ..." and tripped on
+    "what was the project codename before it changed?" — lexical overlap on
+    code/retired, not a dump.
+    """
+    import re
+
+    dataset = generate(1)
+    sentence = bench._CANARY_TEMPLATE.format(value=dataset.canary)
+    bait_words = {
+        w for w in re.findall(r"[a-z]{4,}", sentence.lower())
+    } - {dataset.canary}
+    for case in dataset.cases:
+        asked = set(re.findall(r"[a-z]{4,}", case.question.lower()))
+        assert not (bait_words & asked), (
+            f"canary shares {bait_words & asked} with {case.question!r}"
+        )
+
+
+def test_canary_leak_rate_accompanies_the_binary_trip() -> None:
+    """0.5 cannot distinguish one stray pack from half of them; the rate can."""
+    report = run(1, sessions=3)
+    g = report["guards"]
+    assert 0.0 <= g["canary_leak_rate"] <= 1.0
+    assert (g["canary_leak_rate"] > 0) is g["canary_tripped"]
+
+
+# --- run_seeds ------------------------------------------------------------
+
+
+def test_run_seeds_reports_both_composites_and_the_guards() -> None:
+    report = run_seeds([1, 2], sessions=3)
+    assert report["bench_version"] == bench.BENCH_VERSION
+    assert "composite_mean" in report
+    assert "composite_guarded_mean" in report
+    assert set(report["guards"]) == {"efficiency", "consistency", "canary"}
+    assert report["composite_guarded_mean"] <= report["composite_mean"]
+
+
+def test_run_seeds_tolerates_a_report_without_guards(monkeypatch) -> None:
+    """A bench_version 1 report has no guard block; the aggregate must not crash.
+
+    This is the compatibility case the version stamp exists for — an old
+    recorded run still aggregates, and its guards read as neutral.
+    """
+    def legacy_run(seed: int, **kwargs: object) -> dict:
+        return {
+            "seed": seed, "composite": 0.5,
+            "categories": {name: {"mean": 0.5} for name in CATEGORIES},
+        }
+
+    monkeypatch.setattr(bench, "run", legacy_run)
+    report = run_seeds([1, 2])
+    assert report["composite_mean"] == 0.5
+    assert report["composite_guarded_mean"] == 0.5
+    assert report["guards"] == {
+        "efficiency": 1.0, "consistency": 1.0, "canary": 1.0,
+    }
+
+
+def test_consistency_drops_when_a_rephrasing_changes_the_answer(
+    monkeypatch
+) -> None:
+    """The guard's failure path.
+
+    Stock retrieval agrees with its own paraphrases, so this forces a
+    disagreement: a rewrite that retrieves nothing must cost consistency,
+    which is the brittleness a category mean cannot see.
+    """
+    def destructive(question: str, index: int) -> str:
+        return question if index <= 0 else "zzzz nonexistent query zzzz"
+
+    monkeypatch.setattr(bench, "paraphrase", destructive)
+    report = run(1, sessions=3)
+
+    assert report["guards"]["consistency"] < 1.0
+    assert report["composite_guarded"] < report["composite"]

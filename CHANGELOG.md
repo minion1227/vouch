@@ -7,6 +7,55 @@ All notable changes to vouch are documented here. Format follows
 ## [Unreleased]
 
 ### Added
+- **bench: composite guards** (#616): `efficiency`, `consistency` and `canary`
+  as bounded multipliers over the composite, plus a `bench_version` stamp on
+  every report. Reported **beside** the composite, never folded into it —
+  `composite` keeps its exact formula and meaning, so no recorded score or
+  ladder entry becomes incomparable, and `composite_guarded` is the new
+  measurement the ladder can adopt at a season boundary of the maintainer's
+  choosing. `run_seeds` tolerates a version-1 report with no guard block.
+  Measured on seeds 1-3: efficiency 0.88, consistency 1.00, canary **0.50 —
+  tripped on every seed** (leak rate 0.08-0.24), because a 10-item pack over
+  this corpus carries ~24% of it. That is the lever the guard exists to expose.
+- **pdf and audio sources — page and timestamp receipts** (#613): a spec, a
+  paper, a recorded call could not become citable material, because a receipt is
+  a byte span into a source's stored bytes and the bytes of a pdf or an mp3 do
+  not spell the sentence anyone wants to quote. `vouch source add spec.pdf` (or
+  `call.mp3`) now extracts the text layer / transcript, stores *that* as the
+  content-addressed artifact, and records a **coordinate map** alongside it, so
+  every existing path — ingest, the receipt gate, `kb.source_verify`, receipt
+  coverage — works on it unchanged while a verified receipt also resolves to
+  `p7` or `t=00:14:23` in the original. `vouch source locate <id> <quote>` prints
+  that coordinate; `--raw` registers the binary untouched. **No new hard
+  dependency**: pypdf is the optional `[pdf]` extra, imported lazily, and
+  transcription is a configured command (`sources.transcribe_cmd`, the
+  `compile.llm_cmd` pattern) so vouch never bundles a speech model. A scanned pdf
+  with no text layer fails loudly rather than registering an empty source — ocr
+  is out of scope. The original's sha256 is recorded, so `vouch source verify`
+  re-checks the pdf or the recording for drift instead of losing the link back to
+  it the way extracting by hand does.
+- **cascade delete — the referrers ride along in the proposal** (#600):
+  `kb.propose_delete(..., cascade=true)` and `vouch propose-delete --cascade`.
+  `referenced_by()` refuses a delete while anything still points at the target,
+  which is correct but leaves most of a compiled kb undeletable — pages cite
+  claims in bulk, and a supersede pair is *mutually* locked (`b` lists `a` in
+  `supersedes`, `a`'s `superseded_by` points back at `b`), so neither end of a
+  chain could ever be removed by any delete ordering. The gate is unchanged;
+  what changes is what the reviewer is asked to approve. With `cascade`, the
+  required referrer edits are recorded in the payload as a plan, and
+  `_approve_delete` **re-derives** that plan at approve time — the same posture
+  as the existing ref re-check — applies it, and only then deletes, so the
+  approve-time `referenced_by` gate still has to come back empty. Pages and
+  claims lose their pointer (frontmatter *and* the inline `[claim: …]` body
+  markers, via the same `strip_claim_markers` helper `wipe_dead_refs` uses);
+  relations are deleted outright, because an edge whose endpoint is gone has no
+  meaning, and relations carry no inbound refs of their own, so the walk is one
+  level deep by construction with no transitive cascade to bound. Every edit
+  lands its own irreversible audit event (`page.cascade_unlink`,
+  `claim.cascade_unlink`, `relation.delete`) and the `{kind}.delete` event names
+  what it touched. Additive and default-off: `cascade` omitted reproduces
+  today's behaviour exactly, and the refusal message now names the flag so the
+  dead end is discoverable.
 - **correction capture — the pushback becomes a proposal** (#430): the adapter
   captured tool *outcomes* passively but never the single highest-signal event
   in a session, the user correcting the agent ("no, we deploy from `main` not
@@ -106,6 +155,56 @@ All notable changes to vouch are documented here. Format follows
   artifact the caller could not already retrieve, and it touches no write path.
 
 ### Fixed
+- **`extract` no longer fractures file paths/URLs into auto-approved
+  garbage claims** (#702): the sentence segmenter only skipped a `.` as a
+  boundary when it was flanked by digits on both sides (decimals/versions
+  like `6.8.3`) — every other non-whitespace-flanked period, e.g. in
+  `src/vouch/cli.py`, `cli.py:2550`, or `github.com`, still split the
+  sentence. `segment_source` has no coherence check afterward, only
+  length/letter-ratio filters, so the resulting shards (`"see the
+  changelog at github."`) got auto-approved via `propose_quoted_claim`'s
+  receipt gate as first-class claims. The lookaround is now
+  non-whitespace-flanked rather than digit-only, so a period only ends a
+  segment when followed by whitespace or end-of-string.
+- **vault sync no longer clobbers a second, distinct vault edit made while
+  the first edit's proposal is still pending**: `_has_pending_page_proposal`
+  dedup-checked pending proposals by page id alone, so re-running
+  `vault_to_kb` after a *different* edit to an already-pending page
+  silently skipped filing a new proposal instead of recognizing the edit
+  as distinct. The second edit was never captured in any proposal, and
+  the next backward sync pass then overwrote the vault mirror with the
+  KB's still-unapproved-first-edit content, discarding the second edit
+  with no trace and no error. Now keyed on the content-address (sha256)
+  of the whole edit rather than the page id alone, matching how sources
+  are already fingerprinted elsewhere, so a second distinct edit correctly
+  files its own proposal instead of being coalesced into the first.
+- **`kb.experts` no longer leaks out-of-scope claims into entity rankings**
+  (#714): `rank_experts` aggregated evidence density over every claim in
+  the KB with no viewer/scope filtering at all, unlike every sibling
+  claim-aggregating read surface (`context.py`, `graph.py`, `digest.py`,
+  `health.py`, `compile.py`, and `themes.detect_themes`, the closest
+  shape-wise sibling). A `project`- or `agent`-scoped claim the caller
+  cannot otherwise retrieve still inflated `claim_count`, `citation_count`,
+  and `score`, and could surface verbatim in `top_claim_ids` — handing the
+  caller a claim id it cannot fetch. `rank_experts` now takes an optional
+  `viewer` (defaulting to `scoping.viewer_from(...)`, matching
+  `detect_themes`) and filters through `scoping.is_visible` before a claim
+  can contribute anything, with the FTS candidate fetch run through
+  `scoping.scoped_fetch_limit` so a mostly-out-of-scope KB doesn't starve
+  the candidate pool before the filter runs.
+- **`vouch render-wiki` drops archived pages** (#695):
+  `render_wiki_cmd` passed every on-disk page into index/MOC, so retired
+  titles kept wiki links after archive. the CLI now filters to the same
+  live set as recall / digest / search.
+- **session-split ignores archived pages in TAKEN TOPICS / collisions** (#712):
+  prompts and `_file_drafts` treated every on-disk page as taken, so archiving
+  a session summary permanently blocked redraft under the same title. Both
+  now reuse `compile._live_pages` (same live set as compile post-#700).
+- **`kb.neighbors` drops archived pages** (#696):
+  `_neighbor_ok` already filtered retracted claims but accepted any
+  on-disk page, so archived titles still appeared in neighbors while
+  context-pack expansion dropped them via `_page_is_live`. pages now
+  use the same live check.
 - **`kb.neighbors` no longer leaks edges pointing at excluded nodes**
   (#716): `find_neighbors` appended an edge to the response before
   checking whether its other endpoint passed the same
@@ -146,6 +245,7 @@ All notable changes to vouch are documented here. Format follows
   now the complement of the retired statuses (`SUPERSEDED`/`ARCHIVED`/
   `REDACTED`), matching `context.py`'s `_RETRACTED_CLAIM_STATUSES`
   pattern, so a future status addition defaults to active.
+)
 - **`vouch stats` / `kb.stats` no longer crash on one corrupt `decided/*.yaml`**:
   `_list_decided` parsed every decided proposal strictly, so a single bad file
   aborted `review_summary` / `collect_stats`. It now uses `_load_or_skip` —

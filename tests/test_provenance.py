@@ -311,3 +311,49 @@ def test_kb_why_missing_param_over_jsonl(store: KBStore) -> None:
     resp = handle_request({"id": "4", "method": "kb.why", "params": {}})
     assert resp["ok"] is False
     assert resp["error"]["code"] == "missing_param"
+
+
+# --- archived pages are out of the live set (#701) --------------------------
+
+
+def test_archived_pages_contribute_no_nodes_or_edges(store: KBStore) -> None:
+    """Regression for #701: `build_graph` walked every page with no lifecycle
+    filter, so a retired topic stayed in the provenance graph — undoing
+    archive for anything that renders it."""
+    from vouch.provenance.graph import build_graph
+
+    _seed(store)
+    store.put_page(Page(id="page-dead", title="Dead", type=PageType.CONCEPT,
+                        claims=["c-new"], status=PageStatus.ARCHIVED))
+
+    graph = build_graph(store)
+    assert not [e for e in graph.edges if e.src_id == "page-dead"]
+    assert "page-dead" not in graph.nodes()
+
+
+def test_live_and_draft_pages_still_embed(store: KBStore) -> None:
+    """The filter is archive-only: a draft page is unreviewed, not retired,
+    and the seed's two active pages must keep their EMBEDS edges."""
+    from vouch.provenance.graph import build_graph
+
+    _seed(store)
+    embedders = {
+        e.src_id for e in build_graph(store).edges if e.kind.value == "embeds"
+    }
+    assert {"page-alpha", "page-beta", "page-draft"} <= embedders
+
+
+def test_archiving_a_page_removes_it_from_impact(store: KBStore) -> None:
+    """The user-visible consequence: `impact` stops naming a page the wiki
+    no longer carries."""
+    _seed(store)
+    before = prov.impact(store, claim_id="c-new", depth=2)
+    assert "page-alpha" in str(before["dependents"])
+
+    page = store.get_page("page-alpha")
+    page.status = PageStatus.ARCHIVED
+    store.update_page(page)
+
+    after = prov.impact(store, claim_id="c-new", depth=2, use_cache=False)
+    assert "page-alpha" not in str(after["dependents"])
+    assert "page-beta" in str(after["dependents"])

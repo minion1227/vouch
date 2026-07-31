@@ -368,7 +368,7 @@ def build_split_prompt(
     if git_stat:
         lines += ["GIT STAT:", "```", git_stat, "```", ""]
 
-    pages = store.list_pages()
+    pages = compile_mod._live_pages(store)
     pending = compile_mod._pending_page_names(store)
     taken = [f"- {p.title}" for p in pages] + [f"- {n} [pending]" for n in sorted(pending)]
     lines += ["TAKEN TOPICS (do NOT redraft any of these):"]
@@ -434,7 +434,7 @@ def build_renarrate_prompt(store: KBStore, body: str, *, title: str, max_pages: 
     if title:
         lines += [f"SESSION RECORD TITLE: {title}", ""]
     lines += ["SESSION RECORD (markdown):", body, ""]
-    pages = store.list_pages()
+    pages = compile_mod._live_pages(store)
     pending = compile_mod._pending_page_names(store)
     taken = [f"- {p.title}" for p in pages] + [f"- {n} [pending]" for n in sorted(pending)]
     lines += ["TAKEN TOPICS (do NOT redraft any of these):"]
@@ -492,7 +492,7 @@ def _file_drafts(
     max_pages: int,
     origin: Path | None = None,
 ) -> tuple[list[str], list[dict[str, Any]]]:
-    existing = store.list_pages()
+    existing = compile_mod._live_pages(store)
     taken = {p.title.strip().lower() for p in existing}
     taken |= {p.id.strip().lower() for p in existing}
     taken |= compile_mod._pending_page_names(store)

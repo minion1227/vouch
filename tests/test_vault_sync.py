@@ -590,6 +590,49 @@ def test_vault_to_kb_deduplicates_pending_proposals(
     )
 
 
+def test_vault_to_kb_files_new_proposal_for_second_distinct_edit(
+    store: KBStore, vault: Path,
+) -> None:
+    """A second, *different* vault edit made while the first edit's proposal
+    is still pending must get its own proposal, not be silently coalesced
+    into the first (and then lost once a later backward pass reverts the
+    mirror to canonical KB content, since the KB itself never learned about
+    the second edit)."""
+    kb_to_vault(store, vault)
+    mirror = vault / VAULT_DIR / "pages" / "alpha-page.md"
+    base_text = mirror.read_text(encoding="utf-8")
+
+    edit_a = base_text.replace("Original body.", "Edit A.")
+    mirror.write_text(edit_a, encoding="utf-8")
+    r1 = vault_to_kb(store, vault, actor="vault-sync")
+    assert "alpha-page" in r1.pages_proposed
+    proposals_after_first = list((store.kb_dir / "proposed").glob("*.yaml"))
+    assert len(proposals_after_first) == 1
+
+    # A different edit lands before the first proposal is approved (e.g. the
+    # user tweaks the page again on the next sync tick).
+    edit_b = base_text.replace("Original body.", "Edit B, unrelated to A.")
+    mirror.write_text(edit_b, encoding="utf-8")
+    r2 = vault_to_kb(store, vault, actor="vault-sync")
+    assert "alpha-page" in r2.pages_proposed, (
+        "a distinct second edit must file its own proposal instead of "
+        "being skipped as a duplicate of the first"
+    )
+    proposals_after_second = list((store.kb_dir / "proposed").glob("*.yaml"))
+    assert len(proposals_after_second) == 2, (
+        f"expected 2 proposals (one per distinct edit), got "
+        f"{len(proposals_after_second)}"
+    )
+
+    bodies = set()
+    for path in proposals_after_second:
+        import yaml
+        payload = yaml.safe_load(path.read_text(encoding="utf-8"))
+        bodies.add(payload["payload"]["body"])
+    assert any("Edit A." in b for b in bodies)
+    assert any("Edit B, unrelated to A." in b for b in bodies)
+
+
 def test_vault_to_kb_warns_on_claim_stub_edit(
     store: KBStore, vault: Path, caplog: pytest.LogCaptureFixture,
 ) -> None:

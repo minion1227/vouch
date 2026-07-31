@@ -113,6 +113,37 @@ def test_find_neighbors_excludes_edge_to_missing_neighbor(store: KBStore) -> Non
     assert result["edges"] == []
 
 
+def test_find_neighbors_excludes_archived_pages(store: KBStore) -> None:
+    """Archived pages are out of the live set; neighbors must match
+    context expansion's _page_is_live filter (#696)."""
+    from vouch.models import PageStatus
+
+    store.put_entity(Entity(
+        id="auth", name="Auth", type=EntityType.SYSTEM, page="old-doc",
+    ))
+    store.put_page(Page(
+        id="old-doc", title="Old Auth Doc", body="retired",
+        status=PageStatus.ARCHIVED, entities=["auth"],
+    ))
+    store.put_page(Page(
+        id="live-doc", title="Live Auth Doc", body="current",
+        status=PageStatus.ACTIVE, entities=["auth"],
+    ))
+    # only entity.page is a structural edge from the entity; use a relation
+    # so the live page is also reachable.
+    store.put_relation(Relation(
+        id="auth--references--live-doc",
+        source="auth",
+        relation=RelationType.REFERENCES,
+        target="live-doc",
+    ))
+    result = graph.find_neighbors(store, "auth", depth=1)
+    ids = {n["id"] for n in result["nodes"]}
+    assert "old-doc" not in ids
+    assert "live-doc" in ids
+    assert graph._neighbor_ok(store, "missing-page", "page") is False
+
+
 def test_find_neighbors_unknown_node_raises(store: KBStore) -> None:
     with pytest.raises(ArtifactNotFoundError):
         graph.find_neighbors(store, "missing", depth=1)

@@ -29,10 +29,12 @@ from .storage import KBStore
 # Split on newlines and sentence-ending punctuation. Each match is kept as an
 # exact substring of the source so its receipt verifies; only surrounding
 # whitespace is stripped (the inner run stays contiguous in the source). A `.`
-# flanked by digits is a decimal/version dot ("6.8.3", "3.14"), never a
-# sentence boundary — keep it inside the span so the number-valued fact isn't
-# fractured out of every claim.
-_SEGMENT_RE = re.compile(r"(?:[^\n.!?]|(?<=\d)\.(?=\d))+[.!?]?")
+# is only a sentence boundary when followed by whitespace or end-of-string —
+# one flanked by non-whitespace on both sides is a decimal/version dot
+# ("6.8.3"), a file path/module ("src/vouch/cli.py"), or a domain
+# ("github.com") — never a sentence break, so keep it inside the span rather
+# than fracturing the fact it's embedded in.
+_SEGMENT_RE = re.compile(r"(?:[^\n.!?]|(?<=\S)\.(?=\S))+[.!?]?")
 
 DEFAULT_MIN_CHARS = 16
 DEFAULT_MAX_CHARS = 320

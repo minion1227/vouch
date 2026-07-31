@@ -52,6 +52,22 @@ def test_segment_source_keeps_dotted_numbers_intact() -> None:
     assert any("3.14" in s for s in segs)
 
 
+def test_segment_source_keeps_file_paths_and_urls_intact() -> None:
+    # a period flanked by non-whitespace isn't only a decimal — file paths,
+    # module refs, and domains use the same shape ("cli.py", "github.com")
+    # and must not be fractured mid-sentence into meaningless shards.
+    text = (
+        "The parser bug lives in src/vouch/cli.py:2550 near the top. "
+        "See the changelog at github.com/vouchdev/vouch for details."
+    )
+    segs = extract.segment_source(text)
+    assert "The parser bug lives in src/vouch/cli.py:2550 near the top." in segs
+    assert "See the changelog at github.com/vouchdev/vouch for details." in segs
+    # no fragment starts mid-path (the old bug split right after "cli.")
+    assert not any(s.startswith("py:") for s in segs)
+    assert not any(s.startswith("com/") for s in segs)
+
+
 def test_segment_source_drops_short_noise_and_dupes() -> None:
     text = (
         "ok. The very same sentence appears here twice in a row now. "

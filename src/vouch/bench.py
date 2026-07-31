@@ -87,6 +87,26 @@ those needs a compile step in ``run`` and a grader that inspects which item
 carried the parts. multi-hop-relational is where the derivation axes
 actually bite today.
 
+Composite guards (#616), measured over seeds 1,2,3 @ 2026-07-30. Reported
+beside the composite, never folded into it, and stamped with ``bench_version``
+so a guarded score is never silently compared to a recorded legacy one:
+
+======================  =====================================================
+composite               0.64   — unchanged formula, unchanged meaning
+composite_guarded       0.28   — composite x efficiency x consistency x canary
+efficiency              0.88   — packs run ~12% of budget below the cap
+consistency             1.00   — prefix-form paraphrases do not move retrieval,
+                                 so this is a floor on robustness, not proof
+                                 of it; a content-rewriting paraphrase would
+                                 test harder but risks changing the question
+canary                  0.50   — TRIPPED on every seed, leak rate 0.08-0.24.
+                                 the planted line reaches a pack because a
+                                 10-item pack over this corpus carries ~24% of
+                                 it. this is the lever the guard exists to
+                                 expose, and the reason the guarded composite
+                                 is not yet the ladder's number
+======================  =====================================================
+
 For calibration only (different benchmarks, not directly comparable):
 ditto's stock production-mirroring harness reports memory_mean 0.200-0.226
 on its own v5/v6 contracts, with 0.00 on its consolidation/multi-hop
@@ -145,6 +165,44 @@ CATEGORIES = (
 # haystack grows, which is unavoidable — new facts have to be planted
 # somewhere. See the note at the top of their block in ``generate``.
 _DERIVED_SALT = 0x9E3779B9
+
+# Bench report version. "1" is every score recorded before the composite
+# guards existed. The stamp is the whole compatibility story: a guarded score
+# and a legacy one are different measurements, and a version on the report is
+# what stops them being compared by accident.
+BENCH_VERSION = 2
+
+# Guards (#616). Bounded multipliers over the composite, never categories: a
+# guard averaged in with everything else stops being a guard — canary at zero
+# should be alarming, not a ten-percent dent.
+GUARD_MIN_EFFICIENCY = 0.5   # a maximally wasteful pack still scores half
+CANARY_PENALTY = 0.5         # echoing planted bait halves the composite
+PARAPHRASE_COUNT = 2         # the original plus one metamorphic rephrasing
+
+# Semantically identical rewrites. Template-generated, never LLM-written, so a
+# run stays reproducible from the seed alone.
+_PARAPHRASE_TEMPLATES = (
+    "quick one — {q}",
+    "remind me: {q}",
+    "sorry, asking again: {q}",
+)
+
+# The canary is a coined value planted in the corpus that answers nothing. Any
+# pack that surfaces it is dragging in content no question asked for.
+#
+# The wording matters as much as the value: the sentence must share no
+# vocabulary with any generated question, or the guard measures the
+# generator's word choice instead of the ranker. A first draft used "the
+# retired access code was ..." and tripped on "what was the project codename
+# before it changed?" — lexical overlap on code/retired, not a dump.
+# test_canary_shares_no_vocabulary_with_any_question keeps it honest.
+_CANARY_TEMPLATE = "{value} surfaced in a thread nobody followed up on."
+
+# Graded against the store's receipts and lifecycle rather than the pack text,
+# so a rephrased question cannot change their score.
+_STORE_GRADED_CATEGORIES = frozenset(
+    ("citation-correctness", "receipt-coverage", "supersede-hygiene")
+)
 
 # A superseded, archived, or redacted claim is not a live memory (mirrors
 # the set the context pack excludes).
@@ -333,6 +391,8 @@ class Dataset:
     seed: int
     sessions: tuple[tuple[str, str], ...]  # (title, text)
     cases: tuple[MemoryCase, ...]
+    # Planted bait no question asks for; surfacing it trips the canary guard.
+    canary: str = ""
 
 
 @dataclass
@@ -573,6 +633,12 @@ def generate(seed: int, *, sessions: int = DEFAULT_SESSIONS) -> Dataset:
         "aggregation", sub.choice(set_asks), None, required=tuple(set_items),
     ))
 
+    # The canary: a coined value that answers no question in the dataset. It
+    # sits on the derived rng like the derivation categories, so categories
+    # 1-10 stay byte-identical.
+    canary = coin_distinct(1)[0]
+    docs.add(sub_spread(1)[0], _CANARY_TEMPLATE.format(value=canary))
+
     # Filler prose in every session, shuffled placement.
     for idx in range(sessions):
         for _ in range(rng.randrange(2, 5)):
@@ -583,7 +649,9 @@ def generate(seed: int, *, sessions: int = DEFAULT_SESSIONS) -> Dataset:
         (f"bench session {i + 1}", "\n".join(lines))
         for i, lines in enumerate(docs.buckets)
     )
-    return Dataset(seed=seed, sessions=session_docs, cases=tuple(cases))
+    return Dataset(
+        seed=seed, sessions=session_docs, cases=tuple(cases), canary=canary,
+    )
 
 
 def grade_case(case: MemoryCase, pack_text: str) -> tuple[float, str | None]:
@@ -734,6 +802,51 @@ def _pack_text(pack: dict[str, Any]) -> str:
     return text.replace("«", "").replace("»", "")
 
 
+def paraphrase(question: str, index: int) -> str:
+    """A semantically identical rewrite of ``question``.
+
+    Index 0 is the original. Deterministic and template-driven — an LLM
+    rewrite would make the metamorphic check unreproducible from the seed,
+    which is the one property the whole benchmark rests on.
+    """
+    if index <= 0:
+        return question
+    template = _PARAPHRASE_TEMPLATES[(index - 1) % len(_PARAPHRASE_TEMPLATES)]
+    return template.format(q=question)
+
+
+def efficiency_multiplier(used_chars: list[int], budget_chars: int) -> float:
+    """Bounded penalty on how much budget the answers consumed.
+
+    A strategy that hits the answer by dragging in half the KB is right by
+    luck, not by ranking; this is what makes the dump-guard cost something
+    even on categories with no forbidden value. Bounded below so a wasteful
+    run is penalised, never zeroed — efficiency is a tiebreak, not a verdict.
+    """
+    if not used_chars or budget_chars <= 0:
+        return 1.0
+    mean_used = statistics.mean(used_chars)
+    share = min(1.0, mean_used / budget_chars)
+    return round(GUARD_MIN_EFFICIENCY + (1.0 - GUARD_MIN_EFFICIENCY) * (1.0 - share), 4)
+
+
+def consistency_multiplier(agreements: list[bool]) -> float:
+    """Fraction of cases whose paraphrases all graded the same.
+
+    Metamorphic: a question asked two ways is the same question. Scoring well
+    on one phrasing and badly on its rewrite is brittleness, and a category
+    mean cannot see it.
+    """
+    if not agreements:
+        return 1.0
+    return round(sum(1 for a in agreements if a) / len(agreements), 4)
+
+
+def canary_multiplier(tripped: bool) -> float:
+    """Halve the composite when planted bait reached a pack."""
+    return CANARY_PENALTY if tripped else 1.0
+
+
 def run(
     seed: int,
     *,
@@ -791,12 +904,21 @@ def run(
 
         per_category: dict[str, list[float]] = {c: [] for c in CATEGORIES}
         failures: list[dict[str, Any]] = []
+        used_chars: list[int] = []
+        agreements: list[bool] = []
+        canary_hits = 0
+        packs_seen = 0
         for case in dataset.cases:
             pack = build_context_pack(
                 store, query=case.question, limit=limit, max_chars=budget_chars,
                 strategy=strategy,
             )
             pack_dict = dict(pack)
+            text = _pack_text(pack_dict)
+            used_chars.append(len(text))
+            packs_seen += 1
+            if dataset.canary and dataset.canary in text:
+                canary_hits += 1
             if case.category == "citation-correctness":
                 score, reason = grade_citation_correctness(store, case, pack_dict)
             elif case.category == "receipt-coverage":
@@ -806,6 +928,29 @@ def run(
             else:
                 score, reason = grade_case(case, _pack_text(pack_dict))
             per_category[case.category].append(score)
+
+            # Metamorphic check: the same question, asked another way, must
+            # grade the same. Only the pack-text categories are re-asked —
+            # the three verifiability graders read the store, not the query,
+            # so rephrasing cannot move them.
+            if case.category not in _STORE_GRADED_CATEGORIES:
+                agreed = True
+                for i in range(1, PARAPHRASE_COUNT):
+                    alt = build_context_pack(
+                        store, query=paraphrase(case.question, i), limit=limit,
+                        max_chars=budget_chars, strategy=strategy,
+                    )
+                    alt_dict = dict(alt)
+                    alt_text = _pack_text(alt_dict)
+                    used_chars.append(len(alt_text))
+                    packs_seen += 1
+                    if dataset.canary and dataset.canary in alt_text:
+                        canary_hits += 1
+                    alt_score, _ = grade_case(case, alt_text)
+                    if alt_score != score:
+                        agreed = False
+                agreements.append(agreed)
+
             if reason is not None:
                 failures.append({
                     "category": case.category,
@@ -823,7 +968,33 @@ def run(
     }
     means = [statistics.mean(s) for s in per_category.values() if s]
     composite = round(statistics.mean(means), 4) if means else 0.0
+
+    # The guards are reported beside the composite, never folded into it. An
+    # opaque composite is worse than no composite, and — the compatibility
+    # point — `composite` keeps meaning exactly what every recorded score and
+    # ladder entry already means. `composite_guarded` is the new measurement,
+    # and `bench_version` is what stops the two being compared by accident.
+    # The multiplier is binary per the spec — bait in the pack is bait in the
+    # pack. The leak *rate* is reported beside it because "one stray pack out
+    # of twenty-six" and "half of them" are very different engineering
+    # problems, and a 0.5 that cannot tell them apart is not actionable.
+    canary_tripped = canary_hits > 0
+    guards = {
+        "efficiency": efficiency_multiplier(used_chars, budget_chars),
+        "consistency": consistency_multiplier(agreements),
+        "canary": canary_multiplier(canary_tripped),
+        "canary_tripped": canary_tripped,
+        "canary_leak_rate": (
+            round(canary_hits / packs_seen, 4) if packs_seen else 0.0
+        ),
+    }
+    guarded = round(
+        composite
+        * guards["efficiency"] * guards["consistency"] * guards["canary"],
+        4,
+    )
     return {
+        "bench_version": BENCH_VERSION,
         "seed": seed,
         "budget_chars": budget_chars,
         "limit": limit,
@@ -831,6 +1002,8 @@ def run(
         "cases": len(dataset.cases),
         "categories": categories,
         "composite": composite,
+        "guards": guards,
+        "composite_guarded": guarded,
         "failures": failures,
     }
 
@@ -874,11 +1047,36 @@ def run_seeds(
         ]
         if vals:
             category_means[name] = round(statistics.mean(vals), 4)
+    # Degrade rather than crash on a report without guards: a bench_version 1
+    # run (or a cached one) has no guard block, and the aggregate should still
+    # produce the legacy numbers. Missing guards read as neutral 1.0.
+    guarded = [
+        r.get("composite_guarded", r["composite"]) for r in reports
+    ]
+    guarded_mean = statistics.mean(guarded)
+    guarded_se = (
+        statistics.stdev(guarded) / (len(guarded) ** 0.5)
+        if len(guarded) > 1 else 0.0
+    )
+    guard_means = {
+        name: round(
+            statistics.mean(
+                [float(r.get("guards", {}).get(name, 1.0)) for r in reports]
+            ), 4,
+        )
+        for name in ("efficiency", "consistency", "canary")
+    }
     return {
+        "bench_version": BENCH_VERSION,
         "seeds": seeds,
         "budget_chars": budget_chars,
         "composite_mean": round(mean, 4),
         "composite_se": round(se, 4),
+        # The guarded score is reported alongside so the ladder can adopt it at
+        # a season boundary of the maintainer's choosing, not on merge day.
+        "composite_guarded_mean": round(guarded_mean, 4),
+        "composite_guarded_se": round(guarded_se, 4),
+        "guards": guard_means,
         "categories": category_means,
         "runs": reports,
     }

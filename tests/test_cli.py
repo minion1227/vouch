@@ -795,3 +795,31 @@ def test_render_wiki_writes_index_and_moc(
     index = (out / "index.md").read_text(encoding="utf-8")
     assert "[[Retry Policy]] — retries cap at three" in index
     assert (out / "MOC.md").exists()
+
+
+def test_render_wiki_excludes_archived_pages(
+    store: KBStore, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Archived pages stay on disk but must not enter index/MOC (#695)."""
+    from vouch.models import Page, PageStatus
+
+    monkeypatch.chdir(store.root)
+    store.put_page(Page(
+        id="live", title="Live Topic", body="still current",
+        status=PageStatus.ACTIVE,
+        metadata={"summary": "live summary"},
+    ))
+    store.put_page(Page(
+        id="dead", title="Retired Topic", body="gone",
+        status=PageStatus.ARCHIVED,
+        metadata={"summary": "archived summary"},
+    ))
+    out = tmp_path / "wikiout"
+    result = CliRunner().invoke(cli, ["render-wiki", "--out", str(out)])
+    assert result.exit_code == 0, result.output
+    index = (out / "index.md").read_text(encoding="utf-8")
+    moc = (out / "MOC.md").read_text(encoding="utf-8")
+    assert "Live Topic" in index
+    assert "Retired Topic" not in index
+    assert "Retired Topic" not in moc
+    assert "rendered 1 page(s)" in result.output

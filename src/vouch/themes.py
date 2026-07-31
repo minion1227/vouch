@@ -17,7 +17,7 @@ from typing import Any
 import yaml
 
 from .config_coerce import coerce_bool
-from .models import ClaimStatus, ProposalStatus
+from .models import ClaimStatus, PageStatus, ProposalStatus
 from .proposals import ProposalError, propose_page
 from .scoping import ViewerContext, is_visible, viewer_from
 from .storage import KBStore
@@ -267,9 +267,20 @@ def _resolvable_entities(store: KBStore) -> set[str]:
 
 
 def _existing_theme_entity_sets(store: KBStore) -> set[frozenset[str]]:
-    """Return entity sets of existing theme pages and pending theme proposals."""
+    """Return entity sets of live theme pages and pending theme proposals.
+
+    Archived theme pages are excluded for the same reason claims are excluded
+    via ``_EXCLUDED_STATUSES``: archive is how an operator retires a wrong
+    theme, and counting a retired page here makes that retirement permanent
+    for its entity cluster — the same one-way trap compile's TAKEN TOPICS had
+    (#700). A *pending* proposal still counts: awaiting review is not
+    retirement, and two proposals for one cluster is the duplicate this guard
+    exists to prevent.
+    """
     result: set[frozenset[str]] = set()
     for page in store.list_pages():
+        if page.status is PageStatus.ARCHIVED:
+            continue
         if page.type == "theme" and page.entities:
             result.add(frozenset(page.entities))
     for prop in store.list_proposals(ProposalStatus.PENDING):

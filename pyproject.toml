@@ -28,6 +28,12 @@ embeddings = [
     "sentence-transformers>=3,<4",
     "numpy>=1.26,<2",
 ]
+# pdf text extraction for `vouch source add foo.pdf`. optional on purpose:
+# nothing imports pypdf unless a caller registers a pdf, and audio needs no
+# extra at all — transcription is a configured command, not a bundled model.
+pdf = [
+    "pypdf>=4,<7",
+]
 web = [
     "fastapi>=0.115,<1",
     "jinja2>=3,<4",
@@ -166,6 +172,13 @@ ignore_missing_imports = true
 
 [[tool.mypy.overrides]]
 module = ["fastembed", "fastembed.*"]
+ignore_missing_imports = true
+
+# pypdf lives behind the [pdf] extra; the base CI install only has [dev,web].
+# media.extract_pdf_pages imports it lazily and raises a MediaError naming the
+# extra when it is absent, so the runtime story stays clean without it.
+[[tool.mypy.overrides]]
+module = ["pypdf", "pypdf.*"]
 ignore_missing_imports = true
 
 # fastapi + jinja2 + uvicorn live behind the [web] extra; the base CI install

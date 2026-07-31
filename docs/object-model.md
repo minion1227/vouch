@@ -54,6 +54,44 @@ locally.
 20-25 of meeting-notes.md" or "0:14:23 in the recording". Claims can
 cite either Sources or Evidence.
 
+### PDFs and audio
+
+A pdf or a recording cannot be quoted directly — a receipt is a byte
+range into the stored bytes, and the bytes of a pdf or an mp3 don't
+spell the sentence you want to cite. `vouch source add spec.pdf` (or
+`call.mp3`) extracts the text first and stores *that* as the source, so
+citations work exactly as they do for a text file. Alongside it vouch
+keeps a **coordinate map**: which byte range came from which page, or
+from which point in the recording.
+
+The upshot is a citation that verifies mechanically *and* points
+somewhere a human can check:
+
+```console
+$ vouch source add postmortem.pdf
+9f2c…                        # id of the extracted text
+$ vouch source locate 9f2c… "rollback took eleven minutes"
+p7@b1200-1340                # page 7, bytes 1200-1340
+```
+
+Two deliberate limits. Extraction needs the optional `[pdf]` extra
+(`pip install 'vouch-kb[pdf]'`), and a scanned pdf with **no text
+layer** is refused rather than silently registered empty — vouch does
+not OCR. Audio needs no extra: transcription is a command you configure,
+so vouch never bundles a speech model.
+
+```yaml
+# .vouch/config.yaml
+sources:
+  transcribe_cmd: "whisper --output_format vtt --output_dir - {path}"
+```
+
+The command must emit WebVTT or SubRip; `{path}` is replaced with the
+audio file's path. vouch records the original file's sha256 too, so
+`vouch source verify` still notices if the pdf or the recording changes
+underneath a claim that cites it. Pass `--raw` to register the bytes
+untouched instead.
+
 ## Claims are atomic
 
 A **Claim** is the smallest statement worth citing or contradicting.

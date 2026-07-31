@@ -21,7 +21,7 @@ import pytest
 from vouch import capture, session_split
 from vouch import compile as compile_mod
 from vouch.llm_draft import LLMDraftError
-from vouch.models import Page, Proposal, ProposalKind, ProposalStatus
+from vouch.models import Page, PageStatus, Proposal, ProposalKind, ProposalStatus
 from vouch.session_split import SPLIT_ACTOR, SplitConfig, load_split_config
 from vouch.storage import KBStore
 
@@ -152,6 +152,36 @@ def test_renarrate_prompt_lists_durable_and_pending_topics(
     pending = compile_mod._pending_page_names(store)
     if "retrieval backends" in pending:
         assert "- retrieval backends [pending]" in prompt
+
+
+def test_renarrate_prompt_and_file_drafts_ignore_archived_pages(
+    store: KBStore,
+) -> None:
+    """Archived pages must not block TAKEN TOPICS or draft collision (#712)."""
+    store.put_page(Page(
+        id="archived-session-topic",
+        title="retired session topic XYZ",
+        status=PageStatus.ARCHIVED,
+    ))
+    store.put_page(Page(
+        id="live-topic",
+        title="landed the review gate",
+        status=PageStatus.ACTIVE,
+    ))
+    prompt = session_split.build_renarrate_prompt(
+        store, "body", title="t", max_pages=3,
+    )
+    assert "retired session topic XYZ" not in prompt
+    assert "landed the review gate" in prompt
+
+    ids, dropped = session_split._file_drafts(
+        store,
+        "s-arch",
+        [{"title": "retired session topic XYZ", "body": "rewrote the retired topic"}],
+        max_pages=3,
+    )
+    assert len(ids) == 1
+    assert dropped == []
 
 
 # --- _try_renarrate ------------------------------------------------------

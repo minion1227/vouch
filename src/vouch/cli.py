@@ -42,6 +42,7 @@ from . import hub as hub_mod
 from . import inbox as inbox_mod
 from . import install_adapter as install_mod
 from . import lifecycle as life
+from . import media as media_mod
 from . import metrics as metrics_mod
 from . import migrations as migrations_mod
 from . import notify as notify_mod
@@ -49,6 +50,7 @@ from . import pins as pins_mod
 from . import pr_cache as prc_mod
 from . import provenance as prov_mod
 from . import recall as recall_mod
+from . import receipts as receipts_mod
 from . import sessions as sess_mod
 from . import skills as skills_mod
 from . import stats as stats_mod
@@ -62,7 +64,7 @@ from .capabilities import capabilities as build_caps
 from .context import build_context_pack
 from .lifecycle import LifecycleError
 from .logging_config import configure_logging
-from .models import Proposal, ProposalKind, ProposalStatus
+from .models import PageStatus, Proposal, ProposalKind, ProposalStatus
 from .onboarding import (
     DEFAULT_TEMPLATE,
     TEMPLATES,
@@ -2376,8 +2378,13 @@ def propose_relation_cmd(src: str, relation: str, target: str, confidence: float
 @click.argument("target_id")
 @click.option("--rationale", default=None)
 @click.option("--dry-run", is_flag=True, help="Validate without filing the proposal.")
+@click.option(
+    "--cascade", is_flag=True,
+    help="Include the referrer edits in the proposal instead of being refused.",
+)
 def propose_delete_cmd(
-    target_kind: str, target_id: str, rationale: str | None, dry_run: bool
+    target_kind: str, target_id: str, rationale: str | None, dry_run: bool,
+    cascade: bool,
 ) -> None:
     """File a review-gated request to hard-delete an artifact."""
     store = _load_store()
@@ -2388,6 +2395,7 @@ def propose_delete_cmd(
             target_id=target_id,
             rationale=rationale,
             dry_run=dry_run,
+            cascade=cascade,
             proposed_by=_whoami(),
         )
     click.echo(pr.id)
@@ -2406,9 +2414,51 @@ def source() -> None:
 @click.option("--title", default=None)
 @click.option("--url", default=None)
 @click.option("--type", "source_type", default="file", show_default=True)
-def source_add(path: str, title: str | None, url: str | None, source_type: str) -> None:
-    """Register a file as a Source; prints its sha256 id."""
+@click.option(
+    "--raw",
+    is_flag=True,
+    help="Register the bytes as-is, skipping pdf/audio text extraction.",
+)
+@click.option(
+    "--transcribe-cmd",
+    default=None,
+    help="Override sources.transcribe_cmd for this audio file.",
+)
+def source_add(
+    path: str,
+    title: str | None,
+    url: str | None,
+    source_type: str,
+    raw: bool,
+    transcribe_cmd: str | None,
+) -> None:
+    """Register a file as a Source; prints its sha256 id.
+
+    A pdf or an audio file is extracted to text first, so the quotes a claim
+    cites are actually present in the stored bytes and earn a receipt. The
+    extracted text carries a page/timestamp map back to the original — pass
+    --raw to register the binary untouched instead.
+    """
     store = _load_store()
+    kind = None if raw else media_mod.media_kind(Path(path))
+    if kind is not None:
+        with _cli_errors():
+            src = media_mod.register_media_source(
+                store,
+                Path(path),
+                kind=kind,
+                title=title,
+                transcribe_cmd=transcribe_cmd,
+            )
+        audit_mod.log_event(
+            store.kb_dir,
+            event="source.add",
+            actor=_whoami(),
+            object_ids=[src.id],
+            data={"media": kind.value},
+        )
+        click.echo(src.id)
+        return
     data = Path(path).read_bytes()
     with _cli_errors():
         src = store.put_source(
@@ -2466,6 +2516,33 @@ def source_fetch(
         data={"url": url},
     )
     click.echo(src.id)
+
+
+@source.command("locate")
+@click.argument("source_id")
+@click.argument("quote")
+def source_locate(source_id: str, quote: str) -> None:
+    """Print where QUOTE sits in SOURCE_ID — byte span plus page/timestamp.
+
+    The receipt made legible: for a pdf or an audio source this answers "which
+    page" or "which point in the recording", which is the difference between a
+    citation a reviewer can check against the original and one they cannot.
+    """
+    store = _load_store()
+    with _cli_errors():
+        src = store.get_source(source_id)
+        content = store.read_source_content(source_id)
+    span = receipts_mod.locate_span(content, quote)
+    if span is None:
+        click.echo("quote not found verbatim in source", err=True)
+        sys.exit(1)
+    start, end = span
+    coordinates = media_mod.source_coordinates(src)
+    click.echo(
+        media_mod.locator_for_span(coordinates, start, end)
+        if coordinates
+        else f"b{start}-{end}"
+    )
 
 
 @source.command("verify")
@@ -3402,7 +3479,9 @@ def render_wiki_cmd(out_dir: str | None) -> None:
     With --out, writes index.md and MOC.md there; otherwise prints the index.
     """
     store = _load_store()
-    pages = store.list_pages()
+    # same live set as recall / digest / search — archived pages stay on disk
+    # but are out of the wiki front door (#695).
+    pages = [p for p in store.list_pages() if p.status is not PageStatus.ARCHIVED]
     index = wiki_render_mod.render_index(pages)
     if out_dir is None:
         _echo(index)

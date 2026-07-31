@@ -284,3 +284,70 @@ def test_detect_themes_top_k(store: KBStore) -> None:
     _seed_multi_session_claims(store)
     result = themes.detect_themes(store, min_sessions=1, min_claims=1, top_k=1)
     assert len(result.clusters) <= 1
+
+
+# --- archived theme pages are retired, not permanently taken (#704) ---------
+
+
+def _theme_page(store: KBStore, page_id: str, entities: list[str], status: str):
+    from vouch.models import Entity, EntityType, Page, PageStatus, PageType
+
+    for eid in entities:  # the write gate rejects dangling entity refs
+        store.put_entity(Entity(id=eid, name=eid, type=EntityType.CONCEPT))
+    return store.put_page(Page(
+        id=page_id, title=page_id, type=PageType.THEME, body="x",
+        entities=entities, status=PageStatus(status),
+    ))
+
+
+def test_an_archived_theme_page_no_longer_blocks_its_entity_set(
+    store: KBStore,
+) -> None:
+    """Regression for #704: archive is how an operator retires a wrong theme,
+    but the retired page kept contributing its entity set to the dedupe guard
+    — so that cluster could never be re-synthesized without hand-editing
+    storage."""
+    _theme_page(store, "theme-auth", ["a", "b"], "archived")
+    assert frozenset({"a", "b"}) not in themes._existing_theme_entity_sets(store)
+
+
+def test_a_live_theme_page_still_blocks_its_entity_set(store: KBStore) -> None:
+    _theme_page(store, "theme-auth", ["a", "b"], "active")
+    assert frozenset({"a", "b"}) in themes._existing_theme_entity_sets(store)
+
+
+def test_a_pending_theme_proposal_still_blocks(store: KBStore) -> None:
+    """Awaiting review is not retirement — two proposals for one cluster is
+    exactly the duplicate this guard exists to prevent."""
+    _seed_multi_session_claims(store)
+    result = themes.detect_themes(store, min_sessions=2, min_claims=2)
+    cluster = result.clusters[0]
+    themes.propose_theme(store, cluster, proposed_by="agent")
+    assert frozenset(cluster.entities) in themes._existing_theme_entity_sets(store)
+
+
+def test_archiving_a_theme_page_lets_detect_resurface_the_cluster(
+    store: KBStore,
+) -> None:
+    """The user-visible consequence, end to end: approve a theme, archive it,
+    and the cluster comes back as detectable."""
+    from vouch.models import PageStatus
+    from vouch.proposals import approve as approve_proposal
+
+    _seed_multi_session_claims(store)
+    cluster = themes.detect_themes(store, min_sessions=2, min_claims=2).clusters[0]
+    filed = themes.propose_theme(store, cluster, proposed_by="agent")
+    page = approve_proposal(store, filed["proposal_id"], approved_by="reviewer")
+
+    # while the page is live the cluster stays deduped away
+    still_gone = themes.detect_themes(store, min_sessions=2, min_claims=2)
+    assert not [
+        c for c in still_gone.clusters if set(c.entities) == set(cluster.entities)
+    ]
+
+    stored = store.get_page(page.id)
+    stored.status = PageStatus.ARCHIVED
+    store.update_page(stored)
+
+    back = themes.detect_themes(store, min_sessions=2, min_claims=2)
+    assert [c for c in back.clusters if set(c.entities) == set(cluster.entities)]

@@ -553,6 +553,7 @@ def _h_propose_delete(p: dict) -> dict:
         rationale=p.get("rationale"),
         session_id=p.get("session_id"),
         dry_run=bool(p.get("dry_run", False)),
+        cascade=bool(p.get("cascade", False)),
         proposed_by=_agent(),
     )
     return {

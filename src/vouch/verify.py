@@ -40,7 +40,15 @@ def verify_source(store: KBStore, source: Source) -> VerificationResult:
 
     external_status = "n/a"
     note: str | None = None
-    if source.type.value == "file":
+    # A media source (pdf, audio) stores *extracted text*, so its id is the hash
+    # of the derivation and never of the file on disk. Comparing against the
+    # original's recorded digest is what keeps it re-checkable — otherwise
+    # extraction would sever the link back to the pdf or the recording, which is
+    # the whole reason to extract inside vouch rather than by hand (#613).
+    origin_hash = source.metadata.get("origin_sha256")
+    is_file = source.type.value == "file"
+    if is_file or isinstance(origin_hash, str):
+        expected = source.id if is_file else str(origin_hash)
         try:
             _resolved, external_body = store.read_under_root(source.locator)
         except (OSError, ValueError) as e:
@@ -48,7 +56,7 @@ def verify_source(store: KBStore, source: Source) -> VerificationResult:
             note = f"unreadable: {e}"
         else:
             external_status = (
-                "match" if sha256_hex(external_body) == source.id else "drift"
+                "match" if sha256_hex(external_body) == expected else "drift"
             )
 
     return VerificationResult(

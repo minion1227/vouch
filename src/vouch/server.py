@@ -804,17 +804,21 @@ def kb_propose_relation(
 def kb_propose_delete(
     target_kind: str, target_id: str, rationale: str | None = None,
     session_id: str | None = None, dry_run: bool = False,
+    cascade: bool = False,
 ) -> dict[str, Any]:
     """Propose hard-deleting a durable artifact (claim/page/entity/relation).
 
     Files a PENDING delete request that a *different* reviewer approves via
-    kb.approve. Refused if the target is still referenced by another artifact.
+    kb.approve. Refused if the target is still referenced by another artifact,
+    unless cascade=True, which records the referrer edits (pages and claims
+    lose their pointer, relations are deleted) in the same proposal so the
+    reviewer approves the whole set as one decision.
     """
     try:
         pr = propose_delete(
             _store(), target_kind=target_kind, target_id=target_id,
             proposed_by=_agent(), rationale=rationale,
-            session_id=session_id, dry_run=dry_run,
+            session_id=session_id, dry_run=dry_run, cascade=cascade,
         )
     except (ProposalError, ArtifactNotFoundError, ValueError) as e:
         raise ValueError(str(e)) from e

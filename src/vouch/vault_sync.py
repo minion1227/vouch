@@ -314,15 +314,22 @@ def kb_to_vault(store: KBStore, vault_dir: Path) -> VaultSyncResult:
 
 
 def _has_pending_page_proposal(
-    store: KBStore, page_id: str, *, body: str | None = None
+    store: KBStore, page_id: str, *, source_id: str | None = None
 ) -> bool:
     """Return True if a pending proposal already targets ``page_id``.
 
-    When ``body`` is supplied, only returns True if the pending proposal
-    also carries the same body — allowing a second different vault edit
-    to file a new proposal even while the first is still pending.
-    Prevents duplicate proposals when vault_to_kb runs multiple times
-    before the reviewer approves the first proposal for a given page edit.
+    When ``source_id`` is supplied, only returns True if the pending
+    proposal also cites that vault-edit source — allowing a second,
+    *different* vault edit to file its own proposal even while the first
+    is still pending, rather than being silently coalesced into it and
+    then clobbered by the next backward sync pass. The source id is the
+    content-address (sha256) of the whole mirror file `put_source` would
+    assign — the canonical fingerprint of the complete edit (title, type,
+    tags, claims, entities, body), not just the body text. Without this
+    guard, running vault_to_kb twice before the first proposal is
+    approved files duplicate proposals for the same edit, cluttering the
+    review queue and causing the second approve to fail with "page
+    already exists".
     """
     from .models import ProposalKind, ProposalStatus
     for proposal in store.list_proposals(ProposalStatus.PENDING):
@@ -331,7 +338,7 @@ def _has_pending_page_proposal(
         payload = proposal.payload
         if not isinstance(payload, dict) or payload.get("id") != page_id:
             continue
-        if body is None or payload.get("body") == body:
+        if source_id is None or source_id in (payload.get("sources") or []):
             return True
     return False
 
@@ -398,12 +405,15 @@ def vault_to_kb(
             result.pages_skipped_unknown_id.append(rel)
             continue
 
-        # Fix 2 (#219): skip if a pending proposal already targets this page
-        # id. Without this guard, running vault_to_kb twice before the first
-        # proposal is approved files duplicate proposals for the same edit,
-        # cluttering the review queue and causing the second approve to fail
-        # with "page already exists".
-        if _has_pending_page_proposal(store, page_id):
+        # Fix 2 (#219, refined by #706): skip if a pending proposal already
+        # targets this page id *with this exact edit* (source_id=current_hash
+        # — the content address the vault-edit source below will get).
+        # Without the source_id check, a second, different edit made while
+        # the first proposal is still pending would be misclassified as the
+        # same duplicate, skipped without a new proposal, and then silently
+        # clobbered by the next backward sync pass restoring the mirror to
+        # canonical KB content — the second edit vanishing with no trace.
+        if _has_pending_page_proposal(store, page_id, source_id=current_hash):
             log.debug(
                 "vault sync: pending proposal already exists for page %r; "
                 "skipping to avoid duplicate",
