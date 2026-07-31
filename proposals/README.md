@@ -62,6 +62,7 @@ supersedes them.
 | [0005](VEP-0005-richer-scopes.md) | Richer scopes on Claim/Source | draft | — |
 | [0004](VEP-0004-http-transport.md) | HTTP transport | draft | — |
 | [0006](VEP-0006-dual-solve-web.md) | dual-solve web runner | draft | — |
+| [0007](VEP-0007-cascade-delete.md) | cascade option for propose_delete | draft | — |
 
 ## Numbering
 
