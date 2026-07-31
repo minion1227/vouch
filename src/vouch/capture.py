@@ -31,13 +31,14 @@ from typing import Any
 
 import yaml
 
-from .config_coerce import coerce_bool
+from .config_coerce import coerce_bool, coerce_numeric
 from .enrich import Enrichment
 from .models import ProposalStatus
 from .secrets import mask_secrets
 from .storage import KBStore
 
 DEFAULT_ENABLED = True
+DEFAULT_REALTIME = False
 DEFAULT_MIN_OBSERVATIONS = 3
 DEFAULT_DEDUP_WINDOW_SECONDS = 60.0
 # "session": claims are extracted once at SessionEnd from the full transcript.
@@ -51,6 +52,7 @@ CAPTURE_PAGE_TYPE = "session"
 @dataclass(frozen=True)
 class CaptureConfig:
     enabled: bool = DEFAULT_ENABLED
+    realtime: bool = DEFAULT_REALTIME
     min_observations: int = DEFAULT_MIN_OBSERVATIONS
     dedup_window_seconds: float = DEFAULT_DEDUP_WINDOW_SECONDS
     answer_mode: str = DEFAULT_ANSWER_MODE
@@ -72,9 +74,16 @@ def load_config(store: KBStore) -> CaptureConfig:
         answer_mode = DEFAULT_ANSWER_MODE
     return CaptureConfig(
         enabled=coerce_bool(raw.get("enabled", DEFAULT_ENABLED), DEFAULT_ENABLED),
-        min_observations=int(raw.get("min_observations", DEFAULT_MIN_OBSERVATIONS)),
-        dedup_window_seconds=float(
-            raw.get("dedup_window_seconds", DEFAULT_DEDUP_WINDOW_SECONDS)
+        realtime=coerce_bool(raw.get("realtime", DEFAULT_REALTIME), DEFAULT_REALTIME),
+        min_observations=coerce_numeric(
+            raw.get("min_observations", DEFAULT_MIN_OBSERVATIONS),
+            DEFAULT_MIN_OBSERVATIONS,
+            int,
+        ),
+        dedup_window_seconds=coerce_numeric(
+            raw.get("dedup_window_seconds", DEFAULT_DEDUP_WINDOW_SECONDS),
+            DEFAULT_DEDUP_WINDOW_SECONDS,
+            float,
         ),
         answer_mode=answer_mode,
     )
@@ -131,6 +140,10 @@ def observe(
     """Append one observation to the session buffer. Returns True if written."""
     cfg = config or load_config(store)
     if not cfg.enabled:
+        return False
+    # Opt-in: per-tool PostToolUse harvest is off by default (#602). Finalize
+    # rebuilds the same observation shape from the transcript instead.
+    if not cfg.realtime:
         return False
     # Mask credentials before anything is persisted: the buffer rolls into a
     # committed session page and the append-only audit log, so a secret that
@@ -205,6 +218,95 @@ def summarize_tool(
         out["summary"] = f"Fetched: {str(target)[:60]}"
     else:  # Task
         out["summary"] = f"{tool_name} completed"
+    return out
+
+
+def observations_from_transcript(transcript_path: Path) -> list[dict[str, Any]]:
+    """Rebuild PostToolUse-shaped observations from a host transcript.
+
+    Used when ``capture.realtime`` is off so SessionEnd finalize can still feed
+    ``session_split.summarize``'s ``min_observations`` gate without the
+    per-tool buffer. Tries the Claude parser first, then Codex — same
+    host-neutral detection ``transcript.load_transcript`` uses when the
+    caller already has a path (#602 / #645 review).
+
+    Bound: inherits each parser's ``max_messages=2000`` default, so very
+    long sessions may drop their oldest tool calls (the realtime buffer
+    had no such cap).
+    """
+    from .transcript import parse_claude_transcript, parse_codex_transcript
+
+    parsed: dict[str, Any] | None = None
+    for parse in (parse_claude_transcript, parse_codex_transcript):
+        try:
+            candidate = parse(transcript_path)
+        except (OSError, UnicodeDecodeError, ValueError, TypeError, KeyError):
+            continue
+        if not isinstance(candidate, dict):
+            continue
+        obs = _observations_from_parsed(candidate)
+        if obs:
+            return obs
+        # keep the first successful parse as a fallback (empty session)
+        if parsed is None:
+            parsed = candidate
+    return _observations_from_parsed(parsed) if parsed is not None else []
+
+
+def _observations_from_parsed(parsed: dict[str, Any]) -> list[dict[str, Any]]:
+    """Turn normalized transcript ``messages``/``blocks`` into buffer rows."""
+    from .codex_rollout import _observation_from_call
+
+    out: list[dict[str, Any]] = []
+    for msg in parsed.get("messages") or []:
+        if not isinstance(msg, dict):
+            continue
+        for block in msg.get("blocks") or []:
+            if not isinstance(block, dict) or block.get("type") != "tool_use":
+                continue
+            name = block.get("name")
+            tip = block.get("input") if isinstance(block.get("input"), dict) else {}
+            result = block.get("result")
+            response: object = ""
+            if isinstance(result, dict):
+                response = result.get("content") or ""
+                if result.get("is_error"):
+                    response = f"error: {response}"
+            obs = summarize_tool(
+                str(name) if name is not None else None,
+                tip,
+                response,
+            )
+            # Codex tool names (exec_command, apply_patch, …) are not in
+            # _OBSERVED_TOOLS; map them the same way codex_rollout ingest does.
+            if obs is None and name is not None:
+                # parse_codex_transcript wraps args as {"arguments": ...} /
+                # {"input": ...}; unwrap so _observation_from_call sees the
+                # same shape parse_rollout feeds it.
+                call_args: object = tip
+                if isinstance(tip, dict) and "arguments" in tip:
+                    call_args = tip.get("arguments")
+                obs = _observation_from_call(str(name), call_args)
+                if obs is not None and isinstance(response, str) and response:
+                    text = response.lower()
+                    if "error" in text or "failed" in text:
+                        short = str(obs.get("summary", "")).removeprefix("Ran: ")
+                        obs = {**obs, "summary": f"Command failed: {short}"}
+            if obs is None:
+                continue
+            record: dict[str, Any] = {
+                "ts": 0.0,
+                "tool": obs["tool"],
+                "summary": mask_secrets(str(obs["summary"])),
+            }
+            tid = block.get("id")
+            if isinstance(tid, str) and tid:
+                record["tool_use_id"] = tid
+            if obs.get("files"):
+                record["files"] = list(obs["files"])
+            if obs.get("cmd"):
+                record["cmd"] = mask_secrets(str(obs["cmd"]))
+            out.append(record)
     return out
 
 
@@ -581,7 +683,7 @@ def finalize(
     result = session_split.summarize(
         store, session_id, intent=intent, cwd=cwd, project=project,
         generated_at=generated_at, mode=mode, config=cfg, origin=origin,
-        sources=sources,
+        sources=sources, transcript_path=transcript_path,
     )
     if answers is not None:
         result["answers"] = answers

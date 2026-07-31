@@ -418,11 +418,13 @@ def test_fallback_session_summary_records_its_origin(
     being left silently behind."""
     from vouch import capture as cap
 
+    _RT_CFG = cap.CaptureConfig(realtime=True)
+
     origin = tmp_path / "projA"
     origin.mkdir()
     for i in range(3):
         cap.observe(personal, "sum-1", tool="Edit", summary=f"edited f{i}.py",
-                    now=float(i))
+                    now=float(i), config=_RT_CFG)
     result = cap.finalize(personal, "sum-1", cwd=origin, project=origin.name,
                           origin=origin)
     # finalize still returns the id even though the uncited session rollup is

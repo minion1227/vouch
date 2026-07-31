@@ -34,8 +34,10 @@ from . import chatgpt_import as chatgpt_import_mod
 from . import codex_rollout as codex_rollout_mod
 from . import compile as compile_mod
 from . import contradictions as contradictions_mod
+from . import correction as correction_mod
 from . import digest as digest_mod
 from . import fetch as fetch_mod
+from . import goals as goals_mod
 from . import hub as hub_mod
 from . import inbox as inbox_mod
 from . import install_adapter as install_mod
@@ -81,6 +83,7 @@ from .proposals import (
     propose_claim,
     propose_delete,
     propose_entity,
+    propose_goal,
     propose_page,
     propose_relation,
     reject_auto_extracted,
@@ -2570,6 +2573,95 @@ def notify_test(url: str, secret: str | None) -> None:
         sys.exit(1)
 
 
+# --- correction capture ---------------------------------------------------
+
+
+@cli.command(name="capture-correction")
+@click.argument("prompt")
+@click.option("--session-id", default=None)
+@click.option("--context", default=None, help="what the agent had just done")
+def capture_correction_cmd(
+    prompt: str, session_id: str | None, context: str | None
+) -> None:
+    """File a user correction as a pending claim proposal, if it is one."""
+    store = _load_store()
+    with _cli_errors():
+        report = correction_mod.capture(
+            store, prompt=prompt, session_id=session_id,
+            agent=_whoami(), context=context,
+        )
+    click.echo(json.dumps(report, indent=2))
+
+
+# --- goals ----------------------------------------------------------------
+
+
+@cli.command(name="propose-goal")
+@click.option("--title", required=True)
+@click.option("--detail", default=None)
+@click.option("--claim", "claims", multiple=True, help="claim id this goal concerns")
+@click.option("--entity", "entities", multiple=True, help="entity id this goal concerns")
+@click.option("--tag", "tags", multiple=True)
+@click.option("--rationale", default=None)
+def propose_goal_cmd(
+    title: str,
+    detail: str | None,
+    claims: tuple[str, ...],
+    entities: tuple[str, ...],
+    tags: tuple[str, ...],
+    rationale: str | None,
+) -> None:
+    """Propose an in-flight objective for review."""
+    store = _load_store()
+    with _cli_errors():
+        pr = propose_goal(
+            store,
+            title=title,
+            detail=detail,
+            claims=list(claims),
+            entities=list(entities),
+            tags=list(tags),
+            rationale=rationale,
+            proposed_by=_whoami(),
+        )
+    click.echo(pr.id)
+
+
+@cli.command(name="goals")
+@click.option(
+    "--status",
+    default="open",
+    show_default=True,
+    help="goal status to list, or 'all' for every goal",
+)
+def list_goals_cmd(status: str) -> None:
+    """List approved goals, oldest first."""
+    store = _load_store()
+    with _cli_errors():
+        found = goals_mod.list_goals(
+            store, status=None if status == "all" else status
+        )
+    if not found:
+        click.echo(f"no {status} goals" if status != "all" else "no goals")
+        return
+    for goal in found:
+        click.echo(f"{goal.id:50} [{goal.status.value}] {goal.title}")
+
+
+@cli.command(name="goal-status")
+@click.argument("goal_id")
+@click.argument("status")
+@click.option("--reason", default=None)
+def set_goal_status_cmd(goal_id: str, status: str, reason: str | None) -> None:
+    """Move a goal to open / done / abandoned / blocked."""
+    store = _load_store()
+    with _cli_errors():
+        goal = life.set_goal_status(
+            store, goal_id=goal_id, status=status, actor=_whoami(), reason=reason
+        )
+    click.echo(f"{goal.id} -> {goal.status.value}")
+
+
 # --- lifecycle ------------------------------------------------------------
 
 
@@ -2951,6 +3043,18 @@ def capture_observe_cmd() -> None:
         session_id = str(payload.get("session_id") or "")
         if not session_id:
             return
+        start, ok = _hook_start(payload)
+        if not ok:
+            return
+        store = _capture_store(start)
+        if store is None:
+            return
+        cfg = capture_mod.load_config(store)
+        if not cfg.enabled:
+            return
+        if not cfg.realtime:
+            _emit_json({"skipped": "realtime-disabled"})
+            return
         tool_input = payload.get("tool_input")
         obs = capture_mod.summarize_tool(
             payload.get("tool_name"),
@@ -2959,18 +3063,13 @@ def capture_observe_cmd() -> None:
         )
         if obs is None:
             return
-        start, ok = _hook_start(payload)
-        if not ok:
-            return
-        store = _capture_store(start)
-        if store is None:
-            return
         tool_use_id = payload.get("tool_use_id")
         capture_mod.observe(
             store, session_id,
             tool=obs["tool"], summary=obs["summary"],
             files=obs.get("files"), cmd=obs.get("cmd"),
             tool_use_id=str(tool_use_id) if tool_use_id else None,
+            config=cfg,
         )
     except Exception:
         # a capture failure must never break the user's tool call.
@@ -3250,9 +3349,11 @@ def recall_cmd() -> None:
               help="Cap drafted pages (default: compile.max_pages, 5).")
 @click.option("--llm-cmd", default=None,
               help="Override compile.llm_cmd from config.yaml for this run.")
+@click.option("--profile", "profile", is_flag=True,
+              help="Compile the operator-profile page instead of topic pages.")
 @click.option("--json", "as_json", is_flag=True, help="Machine-readable report.")
 def compile_cmd(dry_run: bool, max_pages: int | None,
-                llm_cmd: str | None, as_json: bool) -> None:
+                llm_cmd: str | None, profile: bool, as_json: bool) -> None:
     """Compile approved claims into topic-page proposals (llm-wiki ingest).
 
     Runs the deployment-configured LLM (compile.llm_cmd) over the live
@@ -3263,10 +3364,17 @@ def compile_cmd(dry_run: bool, max_pages: int | None,
     store = _load_store()
     actor = os.environ.get("VOUCH_AGENT") or compile_mod.COMPILE_ACTOR
     try:
-        report = compile_mod.compile_kb(
-            store, actor=actor, triggered_by=_whoami(), llm_cmd=llm_cmd,
-            max_pages=max_pages, dry_run=dry_run,
-        )
+        if profile:
+            # A different page, a different claim set, the same review gate.
+            report = compile_mod.compile_profile(
+                store, actor=actor, triggered_by=_whoami(), llm_cmd=llm_cmd,
+                dry_run=dry_run,
+            )
+        else:
+            report = compile_mod.compile_kb(
+                store, actor=actor, triggered_by=_whoami(), llm_cmd=llm_cmd,
+                max_pages=max_pages, dry_run=dry_run,
+            )
     except compile_mod.CompileError as e:
         raise click.ClickException(str(e)) from e
     if as_json:

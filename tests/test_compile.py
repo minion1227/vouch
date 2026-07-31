@@ -689,3 +689,73 @@ def test_two_phase_compile_drafts_planned_pages(
     cmd = _phased_stub(tmp_path, topics, drafts)
     report = compile_kb(store, config=_cfg(cmd, two_phase=True))
     assert [r["title"] for r in report.proposed] == ["Retry Policy"]
+
+
+# --- archived pages are retired, not permanently taken (#700) ---------------
+
+
+def _archived_page(store: KBStore, page_id: str, title: str) -> None:
+    from vouch.models import Page, PageStatus
+
+    store.put_page(
+        Page(id=page_id, title=title, body="old", status=PageStatus.ARCHIVED)
+    )
+
+
+def test_archived_pages_are_not_listed_as_taken_topics(store: KBStore) -> None:
+    """Regression for #700: an archived topic stayed in TAKEN TOPICS forever,
+    so the LLM was told never to redraft a page the wiki no longer carries."""
+    _approved_claim(store, "the retry limit is three attempts")
+    _archived_page(store, "retry-policy", "Retry Policy")
+
+    prompt = compile_mod.build_prompt(store, max_pages=3)
+    assert "retry-policy: Retry Policy" not in prompt
+    assert "- (none)" in prompt
+
+
+def test_live_pages_are_still_listed_as_taken_topics(store: KBStore) -> None:
+    from vouch.models import Page
+
+    _approved_claim(store, "the retry limit is three attempts")
+    store.put_page(Page(id="live-policy", title="Live Policy", body="current"))
+
+    prompt = compile_mod.build_prompt(store, max_pages=3)
+    assert "live-policy: Live Policy" in prompt
+
+
+def test_a_draft_may_reuse_an_archived_title(
+    store: KBStore, tmp_path: Path
+) -> None:
+    """The other half of #700: the collision gate dropped a draft that reused
+    an archived title, so archiving a bad page made that topic unwritable."""
+    c1 = _approved_claim(store, "the retry limit is three attempts before failing")
+    _archived_page(store, "retry-policy", "Retry Policy")
+
+    cmd = _stub_llm(tmp_path, [{
+        "title": "Retry Policy",
+        "type": "decision",
+        "body": f"Rewritten from scratch [claim: {c1}]",
+        "claims": [c1],
+    }])
+    report = compile_kb(store, config=_cfg(cmd))
+    assert [r["title"] for r in report.proposed] == ["Retry Policy"]
+    assert report.dropped == []
+
+
+def test_a_draft_reusing_a_live_title_is_still_dropped(
+    store: KBStore, tmp_path: Path
+) -> None:
+    from vouch.models import Page
+
+    c1 = _approved_claim(store, "the retry limit is three attempts before failing")
+    store.put_page(Page(id="retry-policy", title="Retry Policy", body="current"))
+
+    cmd = _stub_llm(tmp_path, [{
+        "title": "Retry Policy",
+        "type": "decision",
+        "body": f"Would collide [claim: {c1}]",
+        "claims": [c1],
+    }])
+    report = compile_kb(store, config=_cfg(cmd))
+    assert report.proposed == []
+    assert len(report.dropped) == 1

@@ -166,14 +166,138 @@ def test_settings_json_merges_into_existing(tmp_path: Path) -> None:
     # vouch content merged in
     assert "mcp__vouch__kb_status" in merged["permissions"]["allow"]
     assert any("capture banner" in c for c in start_cmds)
-    post = [h["command"] for g in merged["hooks"].get("PostToolUse", []) for h in g["hooks"]]
     end = [h["command"] for g in merged["hooks"].get("SessionEnd", []) for h in g["hooks"]]
-    assert any("capture observe" in c for c in post)
+    assert "PostToolUse" not in merged["hooks"]
     assert any("capture finalize" in c for c in end)
 
     assert ".claude/settings.json" in result.merged
     assert ".claude/settings.json" not in result.skipped
     assert ".claude/settings.json" not in result.written
+
+
+def test_settings_json_merge_prunes_retired_observe_hooks(tmp_path: Path) -> None:
+    """Re-installing must drop pre-realtime vouch PostToolUse/Stop hooks
+    while keeping the user's own hooks on those events (#645 review)."""
+    settings_dir = tmp_path / ".claude"
+    settings_dir.mkdir()
+    (settings_dir / "settings.json").write_text(json.dumps({
+        "hooks": {
+            "PostToolUse": [
+                {
+                    "matcher": "*",
+                    "hooks": [
+                        {
+                            "type": "command",
+                            "command": "vouch capture observe || true",
+                        },
+                        {
+                            "type": "command",
+                            "command": "my-own-post-tool-hook",
+                        },
+                    ],
+                },
+            ],
+            "Stop": [
+                {
+                    "matcher": "*",
+                    "hooks": [
+                        {
+                            "type": "command",
+                            "command": "vouch capture answer || true",
+                        },
+                    ],
+                },
+            ],
+            "SessionEnd": [
+                {
+                    "matcher": "*",
+                    "hooks": [
+                        {
+                            "type": "command",
+                            "command": "my-own-session-end",
+                        },
+                    ],
+                },
+            ],
+        },
+    }))
+    result = install("claude-code", target=tmp_path, tier="T4")
+    merged = json.loads((settings_dir / "settings.json").read_text())
+
+    post = [
+        h["command"]
+        for g in merged["hooks"].get("PostToolUse", [])
+        for h in g["hooks"]
+    ]
+    assert "my-own-post-tool-hook" in post
+    assert not any("vouch capture observe" in c for c in post)
+    assert "Stop" not in merged["hooks"]  # only held the retired vouch hook
+    end = [
+        h["command"]
+        for g in merged["hooks"].get("SessionEnd", [])
+        for h in g["hooks"]
+    ]
+    assert "my-own-session-end" in end
+    assert any("capture finalize" in c for c in end)
+    assert ".claude/settings.json" in result.merged
+
+
+def test_prune_retired_vouch_hooks_edge_shapes() -> None:
+    """Cover non-string commands, malformed groups, and untouched groups."""
+    from vouch.install_adapter import (
+        _is_retired_vouch_hook_command,
+        _prune_retired_vouch_hooks,
+    )
+
+    assert _is_retired_vouch_hook_command(None) is False
+    assert _is_retired_vouch_hook_command(42) is False
+    assert _is_retired_vouch_hook_command("vouch capture observe") is True
+
+    dst = {
+        "hooks": {
+            "PostToolUse": [
+                "not-a-group",
+                {"matcher": "*", "hooks": "not-a-list"},
+                {
+                    "matcher": "Edit",
+                    "hooks": [
+                        {"type": "command", "command": "user-only-hook"},
+                        {"type": "command", "command": None},
+                    ],
+                },
+                {
+                    "matcher": "*",
+                    "hooks": [
+                        {
+                            "type": "command",
+                            "command": "vouch capture observe || true",
+                        },
+                    ],
+                },
+            ],
+            "Stop": "not-a-list",
+        },
+    }
+    assert _prune_retired_vouch_hooks(dst) is True
+    post = dst["hooks"]["PostToolUse"]
+    assert "not-a-group" in post
+    assert {"matcher": "*", "hooks": "not-a-list"} in post
+    assert any(
+        isinstance(g, dict)
+        and g.get("matcher") == "Edit"
+        and any(h.get("command") == "user-only-hook" for h in g["hooks"])
+        for g in post
+    )
+    assert not any(
+        isinstance(g, dict)
+        and isinstance(g.get("hooks"), list)
+        and any(
+            isinstance(h, dict) and "vouch capture observe" in str(h.get("command"))
+            for h in g["hooks"]
+        )
+        for g in post
+    )
+    assert dst["hooks"]["Stop"] == "not-a-list"
 
 
 def test_settings_json_merge_is_idempotent(tmp_path: Path) -> None:
@@ -189,13 +313,14 @@ def test_settings_json_merge_is_idempotent(tmp_path: Path) -> None:
     assert ".claude/settings.json" not in second.merged
 
     data = json.loads(after)
-    observe_cmds = [
+    assert "PostToolUse" not in data.get("hooks", {})
+    end_cmds = [
         h["command"]
-        for g in data["hooks"]["PostToolUse"]
+        for g in data["hooks"].get("SessionEnd", [])
         for h in g["hooks"]
-        if "capture observe" in h["command"]
+        if "capture finalize" in h["command"]
     ]
-    assert len(observe_cmds) == 1  # not duplicated
+    assert len(end_cmds) == 1  # not duplicated
 
 
 def test_settings_json_written_fresh_when_absent(tmp_path: Path) -> None:

@@ -122,6 +122,7 @@ def reset(kb_dir: Path) -> None:
             "DELETE FROM claims_fts;"
             "DELETE FROM pages_fts;"
             "DELETE FROM entities_fts;"
+            "DELETE FROM embeddings;"
             "DELETE FROM embedding_index;"
             "DELETE FROM query_embedding_cache;"
             "DELETE FROM embedding_dupes;"
@@ -202,6 +203,9 @@ def deindex(conn: sqlite3.Connection, *, kind: str, id: str) -> None:
         conn.execute("DELETE FROM pages_fts WHERE id = ?", (id,))
     elif kind == "entity":
         conn.execute("DELETE FROM entities_fts WHERE id = ?", (id,))
+    conn.execute(
+        "DELETE FROM embeddings WHERE kind = ? AND id = ?", (kind, id)
+    )
     conn.execute(
         "DELETE FROM embedding_index WHERE kind = ? AND id = ?", (kind, id)
     )

@@ -9,6 +9,8 @@ import pytest
 from vouch import capture as cap
 from vouch.storage import KBStore, _starter_config
 
+_RT_CFG = cap.CaptureConfig(realtime=True)
+
 
 @pytest.fixture
 def store(tmp_path: Path) -> KBStore:
@@ -18,24 +20,41 @@ def store(tmp_path: Path) -> KBStore:
 def test_load_config_defaults(store: KBStore) -> None:
     cfg = cap.load_config(store)
     assert cfg.enabled is True
+    assert cfg.realtime is False
     assert cfg.min_observations == 3
     assert cfg.dedup_window_seconds == 60.0
 
 
 def test_load_config_reads_override(store: KBStore) -> None:
     store.config_path.write_text(
-        "capture:\n  enabled: false\n  min_observations: 5\n"
+        "capture:\n  enabled: false\n  realtime: true\n  min_observations: 5\n"
     )
     cfg = cap.load_config(store)
     assert cfg.enabled is False
+    assert cfg.realtime is True
     assert cfg.min_observations == 5
 
 
 def test_load_config_quoted_false_does_not_enable(store: KBStore) -> None:
     """Regression: bool("false") is True in plain Python, so a mistakenly
     quoted `enabled: "false"` previously silently kept capture enabled."""
-    store.config_path.write_text('capture:\n  enabled: "false"\n')
-    assert cap.load_config(store).enabled is False
+    store.config_path.write_text('capture:\n  enabled: "false"\n  realtime: "false"\n')
+    cfg = cap.load_config(store)
+    assert cfg.enabled is False
+    assert cfg.realtime is False
+
+
+def test_load_config_malformed_numeric_falls_back(store: KBStore) -> None:
+    """Regression: bare int()/float() on a config typo used to raise and
+    crash every capture.load_config() caller (session-split capture, codex
+    rollout ingestion) instead of degrading to the default."""
+    store.config_path.write_text(
+        'capture:\n  min_observations: "three"\n'
+        '  dedup_window_seconds: "soon"\n'
+    )
+    cfg = cap.load_config(store)
+    assert cfg.min_observations == cap.DEFAULT_MIN_OBSERVATIONS
+    assert cfg.dedup_window_seconds == cap.DEFAULT_DEDUP_WINDOW_SECONDS
 
 
 def test_buffer_path_under_captures_dir(store: KBStore) -> None:
@@ -44,7 +63,9 @@ def test_buffer_path_under_captures_dir(store: KBStore) -> None:
 
 
 def test_starter_config_has_capture_namespace() -> None:
-    assert _starter_config()["capture"]["enabled"] is True
+    cap_cfg = _starter_config()["capture"]
+    assert cap_cfg["enabled"] is True
+    assert cap_cfg["realtime"] is False
 
 
 def test_finalize_all_drains_receipt_backlog(store: KBStore) -> None:
@@ -70,7 +91,7 @@ def test_init_gitignores_captures(tmp_path: Path) -> None:
 
 
 def test_observe_appends_line(store: KBStore) -> None:
-    wrote = cap.observe(store, "s1", tool="Edit", summary="Edited a.py", now=100.0)
+    wrote = cap.observe(store, "s1", tool="Edit", summary="Edited a.py", now=100.0, config=_RT_CFG)
     assert wrote is True
     lines = cap.buffer_path(store, "s1").read_text().splitlines()
     assert len(lines) == 1
@@ -84,8 +105,7 @@ def test_observe_masks_secrets_before_buffering(store: KBStore) -> None:
         store, "s1", tool="Bash",
         summary="Ran: export AWS_KEY=AKIAIOSFODNN7EXAMPLE",
         cmd="export AWS_KEY=AKIAIOSFODNN7EXAMPLE",
-        now=100.0,
-    )
+        now=100.0, config=_RT_CFG)
     assert wrote is True
     obs = cap._read_observations(cap.buffer_path(store, "s1"))
     assert len(obs) == 1
@@ -94,11 +114,15 @@ def test_observe_masks_secrets_before_buffering(store: KBStore) -> None:
 
 
 def test_observe_dedups_within_window(store: KBStore) -> None:
-    assert cap.observe(store, "s1", tool="Read", summary="Read a.py", now=100.0)
+    assert cap.observe(store, "s1", tool="Read", summary="Read a.py", now=100.0, config=_RT_CFG)
     # identical within 60s window -> skipped
-    assert cap.observe(store, "s1", tool="Read", summary="Read a.py", now=130.0) is False
+    assert cap.observe(
+        store, "s1", tool="Read", summary="Read a.py", now=130.0, config=_RT_CFG,
+    ) is False
     # same key past the window -> written again
-    assert cap.observe(store, "s1", tool="Read", summary="Read a.py", now=200.0)
+    assert cap.observe(
+        store, "s1", tool="Read", summary="Read a.py", now=200.0, config=_RT_CFG,
+    )
     assert len(cap.buffer_path(store, "s1").read_text().splitlines()) == 2
 
 
@@ -108,30 +132,36 @@ def test_observe_dedups_on_tool_use_id(store: KBStore) -> None:
     recorded once — exact and window-free, however the summaries drift."""
     assert cap.observe(
         store, "s1", tool="Read", summary="Read a.py",
-        now=100.0, tool_use_id="toolu_abc",
-    )
+        now=100.0, tool_use_id="toolu_abc", config=_RT_CFG)
     # same event id, different summary, far outside the text-dedup window
     assert cap.observe(
         store, "s1", tool="Read", summary="Read a.py (drifted wording)",
-        now=999.0, tool_use_id="toolu_abc",
-    ) is False
+        now=999.0, tool_use_id="toolu_abc", config=_RT_CFG) is False
     # a different event id still records
     assert cap.observe(
         store, "s1", tool="Read", summary="Read b.py",
-        now=999.0, tool_use_id="toolu_def",
-    )
+        now=999.0, tool_use_id="toolu_def", config=_RT_CFG)
     lines = cap.buffer_path(store, "s1").read_text().splitlines()
     assert len(lines) == 2
 
 
 def test_observe_without_tool_use_id_keeps_window_dedup(store: KBStore) -> None:
     """Hosts that don't send an event id keep the legacy text+window dedup."""
-    assert cap.observe(store, "s1", tool="Read", summary="Read a.py", now=100.0)
-    assert cap.observe(store, "s1", tool="Read", summary="Read a.py", now=130.0) is False
+    assert cap.observe(
+        store, "s1", tool="Read", summary="Read a.py", now=100.0, config=_RT_CFG,
+    )
+    assert cap.observe(
+        store, "s1", tool="Read", summary="Read a.py", now=130.0, config=_RT_CFG,
+    ) is False
 
 
 def test_observe_noop_when_disabled(store: KBStore) -> None:
-    store.config_path.write_text("capture:\n  enabled: false\n")
+    store.config_path.write_text("capture:\n  enabled: false\n  realtime: true\n")
+    assert cap.observe(store, "s1", tool="Edit", summary="x") is False
+    assert not cap.buffer_path(store, "s1").exists()
+
+
+def test_observe_noop_when_realtime_disabled(store: KBStore) -> None:
     assert cap.observe(store, "s1", tool="Edit", summary="x") is False
     assert not cap.buffer_path(store, "s1").exists()
 
@@ -150,6 +180,7 @@ def test_observe_cli_routes_by_payload_cwd(
     elsewhere = tmp_path / "elsewhere"
     elsewhere.mkdir()
     monkeypatch.chdir(elsewhere)
+    store.config_path.write_text("capture:\n  enabled: true\n  realtime: true\n")
     payload = {
         "session_id": "s-routed",
         "cwd": str(store.root),
@@ -213,7 +244,7 @@ def test_summarize_tool_read_grep_web_task() -> None:
 
 
 def test_observe_stores_cmd_field(store: KBStore) -> None:
-    cap.observe(store, "s1", tool="Bash", summary="Ran: ls", cmd="ls -la", now=1.0)
+    cap.observe(store, "s1", tool="Bash", summary="Ran: ls", cmd="ls -la", now=1.0, config=_RT_CFG)
     line = cap.buffer_path(store, "s1").read_text()
     assert "ls -la" in line
 
@@ -303,8 +334,12 @@ def test_build_summary_body_renders_git_and_commands() -> None:
 
 
 def _seed(store: KBStore, sid: str, n: int) -> None:
+    store.config_path.write_text("capture:\n  enabled: true\n  realtime: true\n")
     for i in range(n):
-        cap.observe(store, sid, tool="Edit", summary=f"Edited f{i}.py", now=float(i))
+        cap.observe(
+            store, sid, tool="Edit", summary=f"Edited f{i}.py",
+            now=float(i), config=_RT_CFG,
+        )
 
 
 def test_finalize_files_one_auto_rejected_page(store: KBStore, tmp_path: Path) -> None:
@@ -476,6 +511,7 @@ def _run(store: KBStore, args: list[str], stdin: str = "") -> object:
 
 
 def test_cli_observe_appends(store: KBStore) -> None:
+    store.config_path.write_text("capture:\n  enabled: true\n  realtime: true\n")
     payload = _json.dumps({
         "session_id": "cc-1",
         "tool_name": "Edit",
@@ -493,8 +529,12 @@ def test_cli_observe_never_errors_on_garbage(store: KBStore) -> None:
 
 
 def test_cli_finalize_files_proposal(store: KBStore) -> None:
+    store.config_path.write_text("capture:\n  enabled: true\n  realtime: true\n")
     for i in range(3):
-        cap.observe(store, "cc-2", tool="Edit", summary=f"Edited f{i}.py", now=float(i))
+        cap.observe(
+            store, "cc-2", tool="Edit", summary=f"Edited f{i}.py",
+            now=float(i), config=_RT_CFG,
+        )
     payload = _json.dumps({"session_id": "cc-2", "cwd": str(store.kb_dir.parent)})
     res = _run(store, ["capture", "finalize"], stdin=payload)
     assert res.exit_code == 0
@@ -509,8 +549,12 @@ def test_cli_finalize_files_proposal(store: KBStore) -> None:
 
 
 def test_cli_banner_silent_after_capture_auto_rejected(store: KBStore) -> None:
+    store.config_path.write_text("capture:\n  enabled: true\n  realtime: true\n")
     for i in range(3):
-        cap.observe(store, "cc-3", tool="Edit", summary=f"Edited f{i}.py", now=float(i))
+        cap.observe(
+            store, "cc-3", tool="Edit", summary=f"Edited f{i}.py",
+            now=float(i), config=_RT_CFG,
+        )
     cap.finalize(store, "cc-3", cwd=store.kb_dir.parent)
     # the session page was auto-rejected by admission, so nothing awaits review:
     # the SessionStart banner stays silent rather than announcing a pending page.
@@ -527,6 +571,8 @@ def test_cli_banner_silent_when_none(store: KBStore) -> None:
 
 
 def test_adapter_settings_wires_capture_hooks() -> None:
+    import json as _json
+
     root = Path(__file__).resolve().parents[1]
     settings = _json.loads(
         (root / "adapters/claude-code/.claude/settings.json").read_text()
@@ -540,10 +586,359 @@ def test_adapter_settings_wires_capture_hooks() -> None:
                 out.append(h.get("command", ""))
         return out
 
-    assert any("capture observe" in c for c in commands("PostToolUse"))
+    # realtime harvest is opt-in (#602); shipped template keeps weight-bearing hooks
+    assert "PostToolUse" not in hooks
+    assert "Stop" not in hooks
     assert any("capture finalize" in c for c in commands("SessionEnd"))
     assert any("capture banner" in c for c in commands("SessionStart"))
     assert any("capture finalize-all" in c for c in commands("SessionStart"))
+    assert any("context-hook" in c for c in commands("UserPromptSubmit"))
+
+
+def test_observations_from_transcript_rebuilds_tool_activity(tmp_path: Path) -> None:
+    import json as _json
+
+    transcript = tmp_path / "session.jsonl"
+    rows = [
+        {
+            "type": "assistant",
+            "message": {
+                "content": [
+                    {
+                        "type": "tool_use",
+                        "id": "toolu_1",
+                        "name": "Edit",
+                        "input": {"file_path": "/proj/a.py"},
+                    },
+                    {
+                        "type": "tool_use",
+                        "id": "toolu_2",
+                        "name": "Bash",
+                        "input": {"command": "pytest -q"},
+                    },
+                    {
+                        "type": "tool_use",
+                        "id": "toolu_3",
+                        "name": "Read",
+                        "input": {"file_path": "/proj/b.py"},
+                    },
+                ]
+            },
+        },
+        {
+            "type": "user",
+            "message": {
+                "content": [
+                    {"type": "tool_result", "tool_use_id": "toolu_1", "content": "ok"},
+                    {"type": "tool_result", "tool_use_id": "toolu_2", "content": "passed"},
+                    {"type": "tool_result", "tool_use_id": "toolu_3", "content": "body"},
+                ]
+            },
+        },
+    ]
+    transcript.write_text(
+        "\n".join(_json.dumps(r) for r in rows) + "\n", encoding="utf-8",
+    )
+    obs = cap.observations_from_transcript(transcript)
+    assert len(obs) == 3
+    assert {o["tool"] for o in obs} == {"Edit", "Bash", "Read"}
+    assert any("Edited a.py" in o["summary"] for o in obs)
+    assert any(o.get("cmd") == "pytest -q" for o in obs)
+
+
+def test_observations_from_transcript_rebuilds_codex_tool_activity(
+    tmp_path: Path,
+) -> None:
+    """Codex rollouts must rebuild observations too — hardcoding the Claude
+    parser left non-Claude hosts with an empty buffer and silent
+    below-min finalize (#645 review)."""
+    import json as _json
+
+    transcript = tmp_path / "rollout.jsonl"
+    rows = [
+        {"type": "session_meta", "payload": {
+            "id": "019eec6b-4a0c-7ad0-afd1-68973c902231",
+            "cwd": "/proj", "timestamp": "2026-06-22T08:01:54Z"}},
+        {"type": "turn_context", "payload": {
+            "turn_id": "t1", "cwd": "/proj", "model": "gpt-5-codex"}},
+        {"type": "response_item", "payload": {
+            "type": "message", "role": "user",
+            "content": [{"type": "input_text", "text": "run tests"}]}},
+        {"type": "response_item", "payload": {
+            "type": "function_call", "name": "exec_command",
+            "arguments": '{"cmd": "pytest -q"}', "call_id": "call_1"}},
+        {"type": "response_item", "payload": {
+            "type": "function_call_output", "call_id": "call_1",
+            "output": "3 passed"}},
+        {"type": "response_item", "payload": {
+            "type": "custom_tool_call", "name": "apply_patch",
+            "input": "*** Begin Patch\n*** Add File: /proj/a.py\n+hi\n",
+            "call_id": "call_2"}},
+        {"type": "response_item", "payload": {
+            "type": "custom_tool_call_output", "call_id": "call_2",
+            "output": "Success"}},
+        {"type": "response_item", "payload": {
+            "type": "function_call", "name": "exec_command",
+            "arguments": '{"cmd": "ls src"}', "call_id": "call_3"}},
+        {"type": "response_item", "payload": {
+            "type": "function_call_output", "call_id": "call_3",
+            "output": "a.py\n"}},
+    ]
+    transcript.write_text(
+        "\n".join(_json.dumps(r) for r in rows) + "\n", encoding="utf-8",
+    )
+    obs = cap.observations_from_transcript(transcript)
+    assert len(obs) >= 3
+    assert any(o["tool"] == "Bash" and "pytest" in o["summary"] for o in obs)
+    assert any(o["tool"] == "Edit" for o in obs)
+
+
+def test_observations_from_transcript_edge_paths(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Cover parse failure, non-dict messages, errored tools, and skips."""
+    # unreadable / missing path → empty (OSError path)
+    assert cap.observations_from_transcript(tmp_path / "missing.jsonl") == []
+
+    # both parsers raise → empty
+    broken = tmp_path / "broken.jsonl"
+    broken.write_text("{not json\n", encoding="utf-8")
+
+    def _boom(_path, **_kwargs):
+        raise ValueError("bad transcript")
+
+    monkeypatch.setattr("vouch.transcript.parse_claude_transcript", _boom)
+    monkeypatch.setattr("vouch.transcript.parse_codex_transcript", _boom)
+    assert cap.observations_from_transcript(broken) == []
+
+    # non-dict parse result is skipped (host-neutral loop continue)
+    monkeypatch.setattr(
+        "vouch.transcript.parse_claude_transcript",
+        lambda _p, **_k: ["not", "a", "dict"],
+    )
+    monkeypatch.setattr(
+        "vouch.transcript.parse_codex_transcript",
+        lambda _p, **_k: {"messages": []},
+    )
+    assert cap.observations_from_transcript(broken) == []
+
+    def _odd(_path, **_kwargs):
+        return {
+            "messages": [
+                "skip-me",
+                {
+                    "blocks": [
+                        {
+                            "type": "tool_use",
+                            "name": "Bash",
+                            "input": {"command": "false"},
+                            "result": {
+                                "content": "exit 1",
+                                "is_error": True,
+                            },
+                        },
+                        {
+                            # ignored by both summarize_tool and codex mapper
+                            "type": "tool_use",
+                            "name": "update_plan",
+                            "input": {},
+                            "result": {"content": "x"},
+                        },
+                        "not-a-block",
+                    ],
+                },
+            ],
+        }
+
+    monkeypatch.setattr("vouch.transcript.parse_claude_transcript", _odd)
+    monkeypatch.setattr(
+        "vouch.transcript.parse_codex_transcript",
+        lambda _p, **_k: {"messages": []},
+    )
+    obs = cap.observations_from_transcript(broken)
+    assert len(obs) == 1
+    assert obs[0]["tool"] == "Bash"
+    assert obs[0]["summary"].startswith("Command failed:")
+
+    # Codex mapper path: failed shell output rewrites summary via
+    # _observation_from_call (summarize_tool does not know exec_command).
+    def _codex_fail(_path, **_kwargs):
+        return {
+            "messages": [
+                {
+                    "blocks": [
+                        {
+                            "type": "tool_use",
+                            "name": "exec_command",
+                            "input": {"arguments": '{"cmd": "pytest -q"}'},
+                            "result": {
+                                "content": "failed: 1 error",
+                            },
+                        },
+                    ],
+                },
+            ],
+        }
+
+    monkeypatch.setattr(
+        "vouch.transcript.parse_claude_transcript", _boom,
+    )
+    monkeypatch.setattr(
+        "vouch.transcript.parse_codex_transcript", _codex_fail,
+    )
+    failed = cap.observations_from_transcript(broken)
+    assert len(failed) == 1
+    assert failed[0]["tool"] == "Bash"
+    assert failed[0]["summary"].startswith("Command failed:")
+
+
+def test_observe_cli_skips_when_realtime_disabled(
+    store: KBStore, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import json as _json
+
+    from click.testing import CliRunner
+
+    from vouch.cli import cli
+
+    monkeypatch.chdir(store.root)
+    # default starter has realtime: false
+    payload = _json.dumps({
+        "session_id": "s-rt-off",
+        "cwd": str(store.root),
+        "tool_name": "Edit",
+        "tool_input": {"file_path": str(store.root / "a.py")},
+        "tool_response": "ok",
+    })
+    result = CliRunner().invoke(cli, ["capture", "observe"], input=payload)
+    assert result.exit_code == 0, result.output
+    out = _json.loads(result.output)
+    assert out["skipped"] == "realtime-disabled"
+    assert not cap.buffer_path(store, "s-rt-off").exists()
+
+
+def test_observe_cli_silent_when_capture_disabled(
+    store: KBStore, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import json as _json
+
+    from click.testing import CliRunner
+
+    from vouch.cli import cli
+
+    monkeypatch.chdir(store.root)
+    store.config_path.write_text(
+        "capture:\n  enabled: false\n  realtime: true\n", encoding="utf-8",
+    )
+    payload = _json.dumps({
+        "session_id": "s-off",
+        "cwd": str(store.root),
+        "tool_name": "Edit",
+        "tool_input": {"file_path": str(store.root / "a.py")},
+        "tool_response": "ok",
+    })
+    result = CliRunner().invoke(cli, ["capture", "observe"], input=payload)
+    assert result.exit_code == 0, result.output
+    assert result.output.strip() == ""
+    assert not cap.buffer_path(store, "s-off").exists()
+
+
+def test_observe_cli_silent_when_disabled_even_if_realtime_off(
+    store: KBStore, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """enabled:false must stay silent even when realtime is also off —
+    otherwise a fully-disabled KB prints the skip JSON (#645 review)."""
+    import json as _json
+
+    from click.testing import CliRunner
+
+    from vouch.cli import cli
+
+    monkeypatch.chdir(store.root)
+    store.config_path.write_text(
+        "capture:\n  enabled: false\n  realtime: false\n", encoding="utf-8",
+    )
+    payload = _json.dumps({
+        "session_id": "s-off-both",
+        "cwd": str(store.root),
+        "tool_name": "Edit",
+        "tool_input": {"file_path": str(store.root / "a.py")},
+        "tool_response": "ok",
+    })
+    result = CliRunner().invoke(cli, ["capture", "observe"], input=payload)
+    assert result.exit_code == 0, result.output
+    assert result.output.strip() == ""
+    assert "realtime-disabled" not in result.output
+
+
+def test_observe_cli_noop_when_no_store(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No project KB and no personal fallback → observe exits quietly."""
+    import json as _json
+
+    from click.testing import CliRunner
+
+    from vouch import hub
+    from vouch.cli import cli
+
+    fake_home = tmp_path / "home"
+    fake_home.mkdir()
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: fake_home))
+    monkeypatch.setenv(hub.REGISTRY_ENV, str(fake_home / "registry.yaml"))
+    monkeypatch.delenv("VOUCH_KB_PATH", raising=False)
+    monkeypatch.delenv("VOUCH_PROJECT_DIR", raising=False)
+    nowhere = tmp_path / "nowhere"
+    nowhere.mkdir()
+    monkeypatch.chdir(nowhere)
+    payload = _json.dumps({
+        "session_id": "s-nostore",
+        "cwd": str(nowhere),
+        "tool_name": "Edit",
+        "tool_input": {"file_path": str(nowhere / "a.py")},
+        "tool_response": "ok",
+    })
+    result = CliRunner().invoke(cli, ["capture", "observe"], input=payload)
+    assert result.exit_code == 0, result.output
+    assert result.output.strip() == ""
+
+
+def test_finalize_uses_transcript_when_realtime_off(
+    store: KBStore, tmp_path: Path,
+) -> None:
+    import json as _json
+
+    transcript = tmp_path / "sess.jsonl"
+    tools = [
+        ("toolu_a", "Edit", {"file_path": "/p/a.py"}),
+        ("toolu_b", "Edit", {"file_path": "/p/b.py"}),
+        ("toolu_c", "Edit", {"file_path": "/p/c.py"}),
+    ]
+    rows = [
+        {
+            "type": "assistant",
+            "message": {
+                "content": [
+                    {"type": "tool_use", "id": tid, "name": name, "input": tip}
+                    for tid, name, tip in tools
+                ]
+            },
+        },
+        {
+            "type": "user",
+            "message": {
+                "content": [
+                    {"type": "tool_result", "tool_use_id": tid, "content": "ok"}
+                    for tid, _, _ in tools
+                ]
+            },
+        },
+    ]
+    transcript.write_text(
+        "\n".join(_json.dumps(r) for r in rows) + "\n", encoding="utf-8",
+    )
+    result = cap.finalize(store, "sess-tx", transcript_path=transcript, mode="mechanical")
+    assert result.get("summary_proposal_id") or result.get("summarized")
 
 
 def test_capture_finalize_all_cmd_with_old_buffers(tmp_path: Path, monkeypatch) -> None:
@@ -1043,6 +1438,14 @@ def test_observe_cli_buffers_in_personal_kb_on_fallback(
     _fallback_machine: KBStore, tmp_path: Path, monkeypatch
 ) -> None:
     personal = _fallback_machine
+    # Keep personal.fallback_capture (set by the fixture) while opting into
+    # realtime observe — a full rewrite would wipe the fallback flag.
+    import yaml as _yaml
+
+    cfg = _yaml.safe_load(personal.config_path.read_text(encoding="utf-8")) or {}
+    cfg.setdefault("capture", {})["enabled"] = True
+    cfg.setdefault("capture", {})["realtime"] = True
+    personal.config_path.write_text(_yaml.safe_dump(cfg), encoding="utf-8")
     nowhere = tmp_path / "no-kb-project"
     nowhere.mkdir()
     monkeypatch.chdir(nowhere)

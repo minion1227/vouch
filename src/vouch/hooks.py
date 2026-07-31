@@ -24,6 +24,7 @@ from typing import Any
 
 import yaml
 
+from . import correction as correction_mod
 from . import salience as salience_mod
 from .config_coerce import coerce_bool
 from .context import build_context_pack
@@ -274,6 +275,15 @@ def build_claude_prompt_hook(
         cfg = loaded if isinstance(loaded, dict) else {}
     except Exception:
         cfg = {}
+
+    # Correction capture (#430): the hook already sees the prompt, and the
+    # turn boundary is the only place a pushback is visible. Files a PENDING
+    # proposal for a human to drain — there is no path from here to approve.
+    # Best-effort by contract: maybe_capture swallows its own failures so a
+    # broken KB drops the correction instead of breaking the turn.
+    correction_mod.maybe_capture(
+        store, prompt=prompt, session_id=session_id,
+    )
 
     # Feed the entity-salience reflex (#223) so repeated mentions of an
     # entity within a session sharpen ranking on subsequent turns -- this

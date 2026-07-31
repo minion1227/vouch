@@ -99,6 +99,7 @@ def summarize(
     config: capture.CaptureConfig | None = None,
     origin: Path | None = None,
     sources: list[str] | None = None,
+    transcript_path: Path | None = None,
 ) -> dict[str, Any]:
     """Roll a session buffer into PENDING page proposals. Never approves.
 
@@ -115,10 +116,23 @@ def summarize(
     `sources` are source ids the mechanical page cites (the session-answers
     source `capture.finalize` registers). A cited session page clears the
     admission gate's uncited-diary rule on its own merits.
+
+    When ``capture.realtime`` is off, observations come from the transcript
+    (if provided) instead of the per-tool buffer (#602).
     """
     cfg = config or capture.load_config(store)
     path = capture.buffer_path(store, session_id)
-    observations = capture._read_observations(path)
+    buffered = capture._read_observations(path)
+    if cfg.realtime:
+        observations = buffered
+    elif transcript_path is not None:
+        observations = capture.observations_from_transcript(transcript_path)
+        # empty transcript still allows draining a leftover realtime buffer
+        if not observations:
+            observations = buffered
+    else:
+        # finalize-all / orphan sweep: no transcript, drain the buffer
+        observations = buffered
     if not cfg.enabled:
         return {"captured": len(observations), "summary_proposal_id": None,
                 "summary_proposal_ids": [], "mode": "skipped", "skipped": "disabled",

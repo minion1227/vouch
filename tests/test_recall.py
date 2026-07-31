@@ -93,6 +93,16 @@ def test_load_config_quoted_false_does_not_enable(store: KBStore) -> None:
     assert recall.load_config(store).enabled is False
 
 
+def test_load_config_malformed_max_chars_falls_back(store: KBStore) -> None:
+    """Regression: a bare int() on a config typo used to raise ValueError
+    and crash every recall.load_config() caller (the SessionStart hook
+    among them) instead of degrading to the default."""
+    store.config_path.write_text(
+        'recall:\n  max_chars: "12,000"\n', encoding="utf-8"
+    )
+    assert recall.load_config(store).max_chars == recall.DEFAULT_MAX_CHARS
+
+
 def test_starter_config_has_recall_namespace() -> None:
     assert _starter_config()["recall"]["enabled"] is True
 

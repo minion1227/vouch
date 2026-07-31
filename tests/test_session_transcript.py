@@ -10,6 +10,8 @@ import pytest
 from vouch import capture, transcript
 from vouch.storage import KBStore
 
+_RT_CFG = capture.CaptureConfig(realtime=True)
+
 
 def _write_jsonl(path: Path, records: list[dict]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -144,7 +146,7 @@ def test_load_transcript_degrades_to_observations(
 ) -> None:
     monkeypatch.setenv("VOUCH_CLAUDE_PROJECTS_DIR", str(store.kb_dir / "none"))
     sid = "99999999-9999-9999-9999-999999999999"
-    capture.observe(store, sid, tool="Edit", summary="Edited x.go")
+    capture.observe(store, sid, tool="Edit", summary="Edited x.go", config=_RT_CFG)
     out = transcript.load_transcript(store, sid)
     assert out["available"] is False
     assert out["observations"][0]["tool"] == "Edit"

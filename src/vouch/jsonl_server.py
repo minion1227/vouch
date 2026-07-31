@@ -30,7 +30,9 @@ import yaml
 
 from . import audit, bundle, health, volunteer_context
 from . import compile as compile_mod
+from . import correction as correction_mod
 from . import digest as digest_mod
+from . import goals as goals_mod
 from . import hot_memory as hot_mod
 from . import lifecycle as life
 from . import metrics as metrics_mod
@@ -53,6 +55,7 @@ from .proposals import (
     propose_claim,
     propose_delete,
     propose_entity,
+    propose_goal,
     propose_page,
     propose_relation,
     reject,
@@ -560,6 +563,62 @@ def _h_propose_delete(p: dict) -> dict:
     }
 
 
+def _h_capture_correction(p: dict) -> dict:
+    return correction_mod.capture(
+        _store(),
+        prompt=p["prompt"],
+        session_id=p.get("session_id"),
+        agent=_agent(),
+        context=p.get("context"),
+    )
+
+
+def _h_propose_goal(p: dict) -> dict:
+    pr = propose_goal(
+        _store(),
+        title=p["title"],
+        detail=p.get("detail"),
+        claims=p.get("claims"),
+        entities=p.get("entities"),
+        tags=p.get("tags"),
+        rationale=p.get("rationale"),
+        slug_hint=p.get("slug_hint"),
+        session_id=p.get("session_id"),
+        dry_run=bool(p.get("dry_run", False)),
+        proposed_by=_agent(),
+    )
+    return {
+        "proposal_id": pr.id,
+        "status": pr.status.value,
+        "kind": pr.kind.value,
+        "dry_run": bool(p.get("dry_run", False)),
+    }
+
+
+def _h_list_goals(p: dict) -> dict:
+    store = _store()
+    found = goals_mod.list_goals(
+        store,
+        status=p.get("status", "open"),
+        limit=p.get("limit"),
+    )
+    items = [g.model_dump(mode="json") for g in found]
+    return hot_mod.attach_hot_memory(  # type: ignore[no-any-return]
+        items, store, query=None, list_envelope=True,
+    )
+
+
+def _h_set_goal_status(p: dict) -> dict:
+    g = life.set_goal_status(
+        _store(),
+        goal_id=p["goal_id"],
+        status=p["status"],
+        actor=_agent(),
+        reason=p.get("reason"),
+    )
+    return {"id": g.id, "status": g.status.value, "history": g.history}
+
+
 def _h_approve(p: dict) -> dict:
     a = approve(_store(), p["proposal_id"], approved_by=_agent(),
                 reason=p.get("reason"),
@@ -965,6 +1024,9 @@ HANDLERS: dict[str, Callable[[dict], Any]] = {
     "kb.propose_entity": _h_propose_entity,
     "kb.propose_relation": _h_propose_relation,
     "kb.propose_delete": _h_propose_delete,
+    "kb.propose_goal": _h_propose_goal,
+    "kb.list_goals": _h_list_goals,
+    "kb.set_goal_status": _h_set_goal_status,
     "kb.approve": _h_approve,
     "kb.reject": _h_reject,
     "kb.reject_extracted": _h_reject_extracted,
@@ -981,6 +1043,7 @@ HANDLERS: dict[str, Callable[[dict], Any]] = {
     "kb.session_end": _h_session_end,
     "kb.volunteer_context": _h_volunteer_context,
     "kb.crystallize": _h_crystallize,
+    "kb.capture_correction": _h_capture_correction,
     "kb.index_rebuild": _h_index_rebuild,
     "kb.lint": _h_lint,
     "kb.doctor": _h_doctor,

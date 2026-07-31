@@ -210,6 +210,34 @@ def test_legacy_search_embeddings_ranks_by_cosine(store: KBStore) -> None:
     assert hits[0][1] == "c1"
 
 
+def test_deindex_removes_the_legacy_embeddings_row(store: KBStore) -> None:
+    # deindex()'s own docstring promises to remove "the embedding row for
+    # any kind" but only cleared embedding_index, never the legacy
+    # `embeddings` table search_embeddings (plural) reads — a deleted
+    # artifact's vector leaked there forever.
+    with index_db.open_db(store.kb_dir) as conn:
+        index_db.index_embedding(
+            conn, kind="claim", id="ghost", vec=_vec("gone now").tolist()
+        )
+        conn.commit()
+        index_db.deindex(conn, kind="claim", id="ghost")
+        conn.commit()
+    assert index_db.search_embeddings(store.kb_dir, _vec("gone now").tolist()) == []
+
+
+def test_reset_clears_the_legacy_embeddings_table(store: KBStore) -> None:
+    # reset()'s own docstring warns "leaving stale rows here means semantic
+    # search can return orphaned hits after a reindex" but never cleared
+    # the legacy `embeddings` table itself.
+    with index_db.open_db(store.kb_dir) as conn:
+        index_db.index_embedding(
+            conn, kind="claim", id="c1", vec=_vec("will be reset").tolist()
+        )
+        conn.commit()
+    index_db.reset(store.kb_dir)
+    assert index_db.search_embeddings(store.kb_dir, _vec("will be reset").tolist()) == []
+
+
 def test_legacy_search_embeddings_rejects_an_empty_query(store: KBStore) -> None:
     assert index_db.search_embeddings(store.kb_dir, []) == []
 

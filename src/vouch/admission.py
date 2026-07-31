@@ -50,7 +50,7 @@ if TYPE_CHECKING:
 # Passive session-capture actors whose proposals are auto-rejected on a failed
 # admission check. Deliberate / human / downstream actors are advisory-only.
 AUTO_CAPTURE_ACTORS: frozenset[str] = frozenset(
-    {"vouch-capture", "session-split", "codex"}
+    {"vouch-capture", "session-split", "codex", "auto:correction"}
 )
 
 # ``session`` / ``log`` pages are raw material, not topics — a mirror of

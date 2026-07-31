@@ -7,8 +7,11 @@
 #      company-brain set: `/vouch-ask`, `/vouch-remember`, `/vouch-record`,
 #      `/vouch-followup`, `/vouch-standup`).
 # T4 = `.claude/settings.json`: SessionStart (kb status + capture review banner +
-#      recall digest of approved knowledge), PostToolUse (capture observe),
+#      recall digest of approved knowledge), UserPromptSubmit (context-hook),
 #      SessionEnd (capture finalize), plus read-only kb_* auto-allow.
+#      Per-tool PostToolUse observe / Stop answer are opt-in via
+#      capture.realtime (default off); finalize rebuilds activity from the
+#      transcript.
 #
 # user_mcp = a local-scope MCP registration written to the user's
 #      `~/.claude.json` under `projects[<abs project>].mcpServers`. The `.mcp.json`

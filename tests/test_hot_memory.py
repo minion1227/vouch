@@ -114,6 +114,19 @@ def test_superseded_claim_excluded(store: KBStore) -> None:
     assert hot_mod.compute_hot_memory(store, limit=5) == []
 
 
+def test_actionable_claim_included(store: KBStore) -> None:
+    # lifecycle.confirm()'s first confirmation moves WORKING -> ACTIONABLE —
+    # a live post-approve state, not a retired one. It must stay eligible
+    # for the sidebar the same as WORKING/STABLE/CONTESTED.
+    cid = _approved_claim(store, "confirmed still true")
+    claim = store.get_claim(cid)
+    claim.status = ClaimStatus.ACTIONABLE
+    store.update_claim(claim)
+    rows = hot_mod.compute_hot_memory(store, limit=5)
+    assert len(rows) == 1
+    assert rows[0]["status"] == ClaimStatus.ACTIONABLE.value
+
+
 def test_old_claim_filtered_by_max_age(store: KBStore) -> None:
     cid = _approved_claim(store, "ancient history")
     claim = store.get_claim(cid)

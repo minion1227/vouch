@@ -23,6 +23,8 @@ from .models import (
     ArtifactScope,
     Claim,
     Entity,
+    Goal,
+    GoalStatus,
     Page,
     Proposal,
     ProposalKind,
@@ -511,6 +513,62 @@ def propose_relation(
     )
 
 
+def propose_goal(
+    store: KBStore,
+    *,
+    title: str,
+    proposed_by: str,
+    detail: str | None = None,
+    claims: list[str] | None = None,
+    entities: list[str] | None = None,
+    tags: list[str] | None = None,
+    scope: dict[str, Any] | str | None = None,
+    rationale: str | None = None,
+    slug_hint: str | None = None,
+    session_id: str | None = None,
+    dry_run: bool = False,
+) -> Proposal:
+    """File a review-gated objective. Approving it creates the `open` goal.
+
+    A goal is knowledge about intent, so it takes the same route as every
+    other write: pending proposal → human approve → durable yaml. There is
+    deliberately no direct-write entry point, and the payload is pinned to
+    `status: open` — a proposal cannot land a goal that is already `done`,
+    which would put a transition on disk that never passed through
+    `lifecycle.set_goal_status` and so never reached the audit log.
+    """
+    if not title.strip():
+        raise ProposalError("goal title is empty")
+    for cid in claims or []:
+        if not store._claim_path(cid).exists():
+            raise ProposalError(f"unknown claim id: {cid}")
+    for eid in entities or []:
+        if not store._entity_path(eid).exists():
+            raise ProposalError(f"unknown entity id: {eid}")
+    payload: dict[str, Any] = {
+        "id": slug_hint or _slugify(title),
+        "title": title.strip(),
+        "detail": detail,
+        "status": GoalStatus.OPEN.value,
+        "claims": list(claims or []),
+        "entities": list(entities or []),
+        "tags": list(tags or []),
+    }
+    _stamp_scope(store, payload, scope)
+    # Validate against the model here, at propose time, for the same reason
+    # propose_entity does: a payload that can never pass approve() must not
+    # sit in the pending queue waiting for someone to notice.
+    try:
+        Goal(**payload)
+    except (ValidationError, TypeError) as e:
+        raise ProposalError(f"invalid goal payload: {e}") from e
+    return _file_proposal(
+        store, kind=ProposalKind.GOAL, payload=payload,
+        proposed_by=proposed_by, session_id=session_id,
+        rationale=rationale, dry_run=dry_run,
+    )
+
+
 def propose_delete(
     store: KBStore,
     *,
@@ -720,7 +778,7 @@ def auto_approve_receipts(
 
 def auto_approve_pending(
     store: KBStore, *, actor: str | None = None
-) -> list[Claim | Page | Entity | Relation]:
+) -> list[Claim | Page | Entity | Relation | Goal]:
     """Approve every pending proposal the configured gate allows.
 
     The full drain behind auto-approval-by-default. Under
@@ -743,7 +801,7 @@ def auto_approve_pending(
     review_cfg = _review_config(store)
     if review_cfg.get("approver_role") != "trusted-agent":
         return list(auto_approve_receipts(store, actor=actor))
-    approved: list[Claim | Page | Entity | Relation] = []
+    approved: list[Claim | Page | Entity | Relation | Goal] = []
     for proposal in store.list_proposals(ProposalStatus.PENDING):
         if proposal.kind == ProposalKind.DELETE:
             continue
@@ -839,6 +897,21 @@ def _payload_block_reason(
             Entity(**payload)
         except (ValidationError, TypeError) as e:
             return f"invalid entity payload: {e}"
+    elif proposal.kind == ProposalKind.GOAL:
+        try:
+            goal = Goal(**payload)
+        except (ValidationError, TypeError) as e:
+            return f"invalid goal payload: {e}"
+        if goal.status is not GoalStatus.OPEN:
+            return (
+                f"goal {goal.id} would be approved into status "
+                f"{goal.status.value!r}; only 'open' may be approved — later "
+                "moves go through lifecycle.set_goal_status"
+            )
+        try:
+            store._validate_goal_refs(goal)
+        except ValueError as e:
+            return str(e)
     elif proposal.kind == ProposalKind.DELETE:
         target_kind = str(payload.get("target_kind", ""))
         target_id = str(payload.get("id", ""))
@@ -884,7 +957,7 @@ def approve(
     approved_by: str,
     reason: str | None = None,
     drop_missing_claims: bool = False,
-) -> Claim | Page | Entity | Relation:
+) -> Claim | Page | Entity | Relation | Goal:
     """Approve a pending proposal and write it as a durable artifact.
 
     Raises ProposalError if the proposal is not pending or if
@@ -917,7 +990,7 @@ def approve(
     )
     if proposal.kind != ProposalKind.DELETE and not is_page_update:
         _ensure_no_existing_artifact(store, proposal.kind, payload["id"])
-    result: Claim | Page | Entity | Relation
+    result: Claim | Page | Entity | Relation | Goal
     if proposal.kind == ProposalKind.CLAIM:
         is_auto_approved = approved_by == proposal.proposed_by
         claim = Claim(
@@ -984,6 +1057,10 @@ def approve(
                 type=entity.type.value, aliases=entity.aliases,
             )
         result = entity
+    elif proposal.kind == ProposalKind.GOAL:
+        goal = Goal(approved_by=approved_by, **payload)
+        store.put_goal(goal)
+        result = goal
     elif proposal.kind == ProposalKind.DELETE:
         result = _approve_delete(store, proposal, approved_by=approved_by)
     else:  # RELATION
@@ -1161,6 +1238,7 @@ _ARTIFACT_GETTERS = {
     ProposalKind.PAGE: "get_page",
     ProposalKind.ENTITY: "get_entity",
     ProposalKind.RELATION: "get_relation",
+    ProposalKind.GOAL: "get_goal",
 }
 
 
@@ -1257,7 +1335,7 @@ def referenced_by(store: KBStore, target_kind: str, target_id: str) -> list[str]
 
 def _reconstruct_deleted(
     target_kind: str, snapshot: dict[str, Any]
-) -> Claim | Page | Entity | Relation:
+) -> Claim | Page | Entity | Relation | Goal:
     """Rebuild a typed model from a delete proposal's snapshot.
 
     Used only on the idempotent path (artifact already gone) so the approve
@@ -1274,7 +1352,7 @@ def _reconstruct_deleted(
 
 def _approve_delete(
     store: KBStore, proposal: Proposal, *, approved_by: str
-) -> Claim | Page | Entity | Relation:
+) -> Claim | Page | Entity | Relation | Goal:
     """Execute an approved DELETE proposal: remove the artifact + index rows.
 
     Re-checks references at approve time (they may have appeared since the

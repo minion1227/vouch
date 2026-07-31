@@ -691,12 +691,81 @@ def _event_commands(groups: Any) -> set[str]:
     return cmds
 
 
+def _is_retired_vouch_hook_command(command: object) -> bool:
+    """True for vouch PostToolUse/Stop hooks retired by capture.realtime (#602).
+
+    Matched by substring so both bare ``vouch capture observe`` and wrapped
+    ``vouch capture observe || true`` forms are pruned on reinstall.
+    """
+    if not isinstance(command, str):
+        return False
+    return (
+        "vouch capture observe" in command
+        or "vouch capture answer" in command
+    )
+
+
+def _prune_retired_vouch_hooks(dst: dict[str, Any]) -> bool:
+    """Remove vouch-owned PostToolUse/Stop observe/answer hooks from ``dst``.
+
+    The shipped Claude template no longer installs those events (#602); a
+    re-run of the installer must actually drop them from existing
+    ``settings.json`` files, not only avoid re-adding them.
+    """
+    hooks = dst.get("hooks")
+    if not isinstance(hooks, dict):
+        return False
+    changed = False
+    for event in ("PostToolUse", "Stop"):
+        groups = hooks.get(event)
+        if not isinstance(groups, list):
+            continue
+        new_groups: list[Any] = []
+        for group in groups:
+            if not isinstance(group, dict):
+                new_groups.append(group)
+                continue
+            hook_list = group.get("hooks")
+            if not isinstance(hook_list, list):
+                new_groups.append(group)
+                continue
+            kept = [
+                h for h in hook_list
+                if not (
+                    isinstance(h, dict)
+                    and _is_retired_vouch_hook_command(h.get("command"))
+                )
+            ]
+            if len(kept) != len(hook_list):
+                changed = True
+            if not kept:
+                # drop the whole group when it only held retired vouch hooks
+                continue
+            if len(kept) != len(hook_list):
+                refreshed = {k: v for k, v in group.items() if k != "hooks"}
+                refreshed["hooks"] = kept
+                new_groups.append(refreshed)
+            else:
+                new_groups.append(group)
+        if new_groups != groups:
+            changed = True
+            if new_groups:
+                hooks[event] = new_groups
+            else:
+                del hooks[event]
+    return changed
+
+
 def _merge_settings(src: dict[str, Any], dst: dict[str, Any]) -> bool:
     """Merge our ``permissions.allow`` + ``hooks`` into an existing settings
     dict in place. Returns True if ``dst`` changed. Idempotent: re-merging the
     same ``src`` is a no-op because every command / permission is deduped.
+
+    Also prunes retired vouch PostToolUse/Stop observe/answer hooks so an
+    upgrade from a pre-``capture.realtime`` install actually removes the
+    per-tool spawns (#602).
     """
-    changed = False
+    changed = _prune_retired_vouch_hooks(dst)
 
     # permissions.allow — union, preserving the user's order.
     src_perms = src.get("permissions")

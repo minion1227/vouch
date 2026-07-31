@@ -24,6 +24,7 @@ from vouch import capture as cap
 from vouch.models import ProposalStatus
 from vouch.storage import KBStore
 
+_RT_CFG = cap.CaptureConfig(realtime=True)
 # an answer with three clean, quotable sentences (>160 chars) so segment_source
 # yields receipt-verifiable claims.
 ANSWER = (
@@ -387,7 +388,7 @@ def test_finalize_page_cites_session_source(store: KBStore, tmp_path: Path) -> N
     """The rollup page cites the answers source, so it clears admission."""
     tp = _transcript(tmp_path, [_user(QUESTION), _assistant(ANSWER)])
     for i in range(3):
-        cap.observe(store, "s1", tool="Edit", summary=f"Edit f{i}.py", now=float(i))
+        cap.observe(store, "s1", tool="Edit", summary=f"Edit f{i}.py", now=float(i), config=_RT_CFG)
     res = cap.finalize(store, "s1", cwd=None, transcript_path=tp)
     assert res["answers"]["captured"] is True
     src_id = res["answers"]["source"]
@@ -401,7 +402,7 @@ def test_finalize_recites_source_on_refinalize(store: KBStore, tmp_path: Path) -
     tp = _transcript(tmp_path, [_user(QUESTION), _assistant(ANSWER)])
     cap.capture_session_answers(store, "s1", tp)
     for i in range(3):
-        cap.observe(store, "s1", tool="Edit", summary=f"Edit f{i}.py", now=float(i))
+        cap.observe(store, "s1", tool="Edit", summary=f"Edit f{i}.py", now=float(i), config=_RT_CFG)
     res = cap.finalize(store, "s1", cwd=None, transcript_path=tp)
     assert res["answers"]["skipped"] == "already-captured"
     prop = store.get_proposal(res["summary_proposal_id"])
@@ -430,20 +431,32 @@ UPDATE_JSON = (
 
 
 def _enrich_stub(tmp_path: Path, output: str) -> str:
-    script = tmp_path / "enrich.sh"
-    script.write_text(
-        f"#!/bin/sh\ncat > /dev/null\ncat <<'JSON'\n{output}\nJSON\n",
-        encoding="utf-8",
+    import sys
+
+    out = tmp_path / "enrich-out.json"
+    out.write_text(output, encoding="utf-8")
+    return (
+        f'{sys.executable} -c "import pathlib,sys; '
+        f'sys.stdin.read(); '
+        f'sys.stdout.write(pathlib.Path(r\'{out}\').read_text(encoding=\'utf-8\'))"'
     )
-    return f"sh {script}"
 
 
 def test_finalize_supersedes_updated_claims(store: KBStore, tmp_path: Path) -> None:
+    import yaml
+
     from vouch.models import ClaimStatus
 
     store.config_path.write_text(
-        "review:\n  auto_approve_on_receipt: true\n"
-        f'capture:\n  enrich:\n    llm_cmd: "{_enrich_stub(tmp_path, UPDATE_JSON)}"\n',
+        yaml.safe_dump(
+            {
+                "review": {"auto_approve_on_receipt": True},
+                "capture": {
+                    "realtime": True,
+                    "enrich": {"llm_cmd": _enrich_stub(tmp_path, UPDATE_JSON)},
+                },
+            }
+        ),
         encoding="utf-8",
     )
     # session 1 states the old value; its claims become durable via receipts
@@ -459,7 +472,7 @@ def test_finalize_supersedes_updated_claims(store: KBStore, tmp_path: Path) -> N
     d2 = tmp_path / "s2"
     d2.mkdir()
     for i in range(3):
-        cap.observe(store, "s2", tool="Edit", summary=f"Edit f{i}.py", now=float(i))
+        cap.observe(store, "s2", tool="Edit", summary=f"Edit f{i}.py", now=float(i), config=_RT_CFG)
     res = cap.finalize(
         store, "s2", cwd=None,
         transcript_path=_transcript(d2, [_user("region?"), _assistant(NEW_ANSWER)]),

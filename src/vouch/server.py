@@ -21,7 +21,9 @@ from mcp.server.fastmcp import FastMCP
 
 from . import audit, bundle, health, mcp_profiles, volunteer_context
 from . import compile as compile_mod
+from . import correction as correction_mod
 from . import digest as digest_mod
+from . import goals as goals_mod
 from . import hot_memory as hot_mod
 from . import lifecycle as life
 from . import metrics as metrics_mod
@@ -32,6 +34,7 @@ from . import trust as trust_mod
 from . import verify as verify_mod
 from .capabilities import capabilities as build_caps
 from .context import build_context_pack
+from .lifecycle import LifecycleError
 from .logging_config import configure_logging
 from .models import ProposalStatus
 from .page_filters import filter_pages
@@ -43,6 +46,7 @@ from .proposals import (
     propose_claim,
     propose_delete,
     propose_entity,
+    propose_goal,
     propose_page,
     propose_relation,
     reject,
@@ -815,6 +819,88 @@ def kb_propose_delete(
     except (ProposalError, ArtifactNotFoundError, ValueError) as e:
         raise ValueError(str(e)) from e
     return _proposal_response(pr, dry_run)
+
+
+@mcp.tool()
+def kb_capture_correction(
+    prompt: str, session_id: str | None = None, context: str | None = None
+) -> dict[str, Any]:
+    """Turn a user correction into a PENDING claim proposal.
+
+    Detects pushback ("no, we deploy from main not release") and files it for
+    review, tagged `auto:correction` so the reviewer sees where it came from.
+    Proposes only — there is no path from here to approve. Bounded by
+    `capture.correction.max_per_session` and deduped against what the KB
+    already knows; returns `{"captured": false, "reason": ...}` when a guard
+    declines, so a caller can see why nothing was filed.
+    """
+    return correction_mod.capture(
+        _store(), prompt=prompt, session_id=session_id,
+        agent=_agent(), context=context,
+    )
+
+
+@mcp.tool()
+def kb_propose_goal(
+    title: str,
+    detail: str | None = None,
+    claims: list[str] | None = None,
+    entities: list[str] | None = None,
+    tags: list[str] | None = None,
+    rationale: str | None = None,
+    slug_hint: str | None = None,
+    session_id: str | None = None,
+    dry_run: bool = False,
+) -> dict[str, Any]:
+    """Propose an in-flight objective — what this project is trying to do now.
+
+    Files a PENDING goal a human approves via kb.approve; the approved goal
+    then re-surfaces in the session-start digest so a fresh session picks up
+    the intent, not just the facts. Status moves after approval go through
+    kb.set_goal_status, never through a second proposal.
+    """
+    try:
+        pr = propose_goal(
+            _store(), title=title, detail=detail, claims=claims,
+            entities=entities, tags=tags, rationale=rationale,
+            slug_hint=slug_hint, session_id=session_id, dry_run=dry_run,
+            proposed_by=_agent(),
+        )
+    except (ProposalError, ArtifactNotFoundError, ValueError) as e:
+        raise ValueError(str(e)) from e
+    return _proposal_response(pr, dry_run)
+
+
+@mcp.tool()
+def kb_list_goals(status: str | None = "open", limit: int | None = None) -> dict[str, Any]:
+    """List approved goals, oldest first. Defaults to the open ones."""
+    store = _store()
+    try:
+        found = goals_mod.list_goals(store, status=status, limit=limit)
+    except ValueError as e:
+        raise ValueError(f"unknown goal status: {status!r}") from e
+    items = [g.model_dump(mode="json") for g in found]
+    return hot_mod.attach_hot_memory(  # type: ignore[no-any-return]
+        items, store, query=None, list_envelope=True,
+    )
+
+
+@mcp.tool()
+def kb_set_goal_status(
+    goal_id: str, status: str, reason: str | None = None
+) -> dict[str, Any]:
+    """Move an approved goal to open / done / abandoned / blocked.
+
+    Appends the transition to the audit log — this is the only write path for
+    goal status.
+    """
+    try:
+        g = life.set_goal_status(
+            _store(), goal_id=goal_id, status=status, actor=_agent(), reason=reason,
+        )
+    except (LifecycleError, ArtifactNotFoundError) as e:
+        raise ValueError(str(e)) from e
+    return {"id": g.id, "status": g.status.value, "history": g.history}
 
 
 def _proposal_response(result, dry_run: bool) -> dict[str, Any]:

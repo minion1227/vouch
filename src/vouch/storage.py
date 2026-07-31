@@ -41,6 +41,7 @@ from .models import (
     Claim,
     Entity,
     Evidence,
+    Goal,
     Page,
     Proposal,
     ProposalStatus,
@@ -63,7 +64,7 @@ SCHEMA_VERSION_FILENAME = "schema_version"
 
 SUBDIRS = (
     "claims", "pages", "sources", "entities", "relations",
-    "evidence", "sessions", "proposed", "decided",
+    "evidence", "sessions", "goals", "proposed", "decided",
 )
 
 
@@ -96,6 +97,10 @@ def _starter_config() -> dict[str, Any]:
         "capture": {
             # auto-capture agent sessions into pending summaries.
             "enabled": True,
+            # per-tool PostToolUse buffer; off by default — SessionEnd rebuilds
+            # observations from the transcript (#602). set true to restore the
+            # crash-resistant realtime harvest (and wire PostToolUse yourself).
+            "realtime": False,
             "min_observations": 3,
             # answer memory: "session" extracts claims once at SessionEnd from
             # the full transcript; "turn" files claims on every Stop hook.
@@ -601,6 +606,9 @@ class KBStore:
     def _session_path(self, sid: str) -> Path:
         return self._yaml("sessions", sid)
 
+    def _goal_path(self, gid: str) -> Path:
+        return self._yaml("goals", gid)
+
     def _proposal_path(self, pid: str) -> Path:
         return self._yaml("proposed", pid)
 
@@ -1099,6 +1107,63 @@ class KBStore:
             return []
         return [s for p in sorted(d.glob("*.yaml"))
                 if (s := _load_or_skip(p, Session, "session")) is not None]
+
+    # --- goals ---------------------------------------------------------------
+
+    def _validate_goal_refs(self, goal: Goal) -> None:
+        """Reject a goal pointing at claims/entities that don't exist.
+
+        Mirrors `_validate_claim_refs`: the propose-time check in
+        `proposals.propose_goal` is the friendly error, this is the one that
+        actually closes the write path.
+        """
+        for cid in goal.claims:
+            if not self._claim_path(cid).exists():
+                raise ValueError(f"goal {goal.id} references unknown claim {cid!r}")
+        for eid in goal.entities:
+            if not self._entity_path(eid).exists():
+                raise ValueError(f"goal {goal.id} references unknown entity {eid!r}")
+
+    def put_goal(self, goal: Goal) -> Goal:
+        self._validate_goal_refs(goal)
+        path = self._goal_path(goal.id)
+        # A KB bootstrapped before goals existed has no goals/ directory; the
+        # migration runner adds it, but creating on demand keeps an un-migrated
+        # KB from failing its first approve with a bare FileNotFoundError.
+        path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            with path.open("x", encoding="utf-8") as f:
+                f.write(_yaml_dump(goal.model_dump(mode="json")))
+        except FileExistsError as e:
+            raise ValueError(
+                f"goal {goal.id} already exists -- choose a different slug"
+            ) from e
+        return goal
+
+    def update_goal(self, goal: Goal) -> Goal:
+        """Persist a mutated goal. Only `lifecycle.set_goal_status` calls this."""
+        if not self._goal_path(goal.id).exists():
+            raise ArtifactNotFoundError(f"goal {goal.id}")
+        # Round-trip so in-place mutation can't skip the model validators
+        # (empty title, bad status) — same reason update_claim re-validates.
+        Goal.model_validate(goal.model_dump(mode="json"))
+        self._validate_goal_refs(goal)
+        self._goal_path(goal.id).write_text(
+            _yaml_dump(goal.model_dump(mode="json")), encoding="utf-8")
+        return goal
+
+    def get_goal(self, gid: str) -> Goal:
+        p = self._goal_path(gid)
+        if not p.exists():
+            raise ArtifactNotFoundError(f"goal {gid}")
+        return Goal.model_validate(_yaml_load(p.read_text(encoding="utf-8")))
+
+    def list_goals(self) -> list[Goal]:
+        d = self.kb_dir / "goals"
+        if not d.is_dir():
+            return []
+        return [g for p in sorted(d.glob("*.yaml"))
+                if (g := _load_or_skip(p, Goal, "goal")) is not None]
 
     # --- embedding hook ------------------------------------------------------
 

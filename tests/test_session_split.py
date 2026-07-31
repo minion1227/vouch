@@ -58,15 +58,30 @@ def test_split_config_quoted_false_enabled_does_not_enable(store: KBStore) -> No
     assert load_split_config(store).enabled is False
 
 
+_RT_CFG = None  # set lazily so import stays light
+
+
+def _rt_cfg():
+    from vouch import capture
+    global _RT_CFG
+    if _RT_CFG is None:
+        _RT_CFG = capture.CaptureConfig(realtime=True)
+    return _RT_CFG
+
+
 def _observe(store: KBStore, sid: str, n: int, tool: str = "Edit") -> None:
     from vouch import capture
+    cfg = _rt_cfg()
     for i in range(n):
-        capture.observe(store, sid, tool=tool, summary=f"{tool} file{i}.py", now=float(i))
+        capture.observe(
+            store, sid, tool=tool, summary=f"{tool} file{i}.py",
+            now=float(i), config=cfg,
+        )
 
 
 def test_below_min_skips_and_deletes_buffer(store: KBStore) -> None:
     from vouch import capture
-    capture.observe(store, "s1", tool="Edit", summary="one", now=1.0)
+    capture.observe(store, "s1", tool="Edit", summary="one", now=1.0, config=_rt_cfg())
     res = session_split.summarize(store, "s1")
     assert res["skipped"] == "below-min"
     assert res["summary_proposal_ids"] == []
@@ -106,19 +121,38 @@ def test_finalize_still_returns_summary_proposal_id(store: KBStore) -> None:
 
 
 def _stub_llm(tmp_path: Path, drafts: list[dict]) -> str:
+    """Return an llm_cmd that ignores stdin and emits canned drafts.
+
+    Uses a Python one-liner so the stub works on Windows (no ``cat``) and
+    embeds a path that YAML can quote safely via :func:`_config_with_split`.
+    """
+    import sys
+
     out = tmp_path / "drafts.json"
     out.write_text(json.dumps(drafts), encoding="utf-8")
-    return f"cat {out}"
+    return (
+        f'{sys.executable} -c "import pathlib,sys; '
+        f'sys.stdout.write(pathlib.Path(r\'{out}\').read_text(encoding=\'utf-8\'))"'
+    )
 
 
 def _config_with_split(
     store: KBStore, llm_cmd: str, threshold: int = 3, max_pages: int = 6
 ) -> None:
+    import yaml
+
     store.config_path.write_text(
-        "capture:\n  split:\n"
-        f"    threshold_observations: {threshold}\n"
-        f"    max_pages: {max_pages}\n"
-        f"    llm_cmd: \"{llm_cmd}\"\n",
+        yaml.safe_dump(
+            {
+                "capture": {
+                    "split": {
+                        "threshold_observations": threshold,
+                        "max_pages": max_pages,
+                        "llm_cmd": llm_cmd,
+                    }
+                }
+            }
+        ),
         encoding="utf-8",
     )
 
@@ -202,8 +236,11 @@ def test_cap_enforced(store: KBStore, tmp_path: Path) -> None:
 def test_host_neutral_tool_names_do_not_crash(store: KBStore, tmp_path: Path) -> None:
     from vouch import capture
     for i, tool in enumerate(["fs.write", "shell.exec", "browser.open"]):
-        capture.observe(store, "s1", tool=tool, summary=f"{tool} did thing {i}", now=float(i))
-    capture.observe(store, "s1", tool="fs.write", summary="one more", now=9.0)
+        capture.observe(
+            store, "s1", tool=tool, summary=f"{tool} did thing {i}",
+            now=float(i), config=_rt_cfg(),
+        )
+    capture.observe(store, "s1", tool="fs.write", summary="one more", now=9.0, config=_rt_cfg())
     cmd = _stub_llm(tmp_path, [{"title": "the work", "body": "did things " * 15}])
     _config_with_split(store, cmd, threshold=3)
     res = session_split.summarize(store, "s1", mode="auto")
@@ -211,15 +248,29 @@ def test_host_neutral_tool_names_do_not_crash(store: KBStore, tmp_path: Path) ->
 
 
 def test_truncation_flagged_when_over_budget(store: KBStore, tmp_path: Path) -> None:
+    import yaml
+
     from vouch import capture
     # distinct summaries so capture.observe's dedup window does not collapse them
     for i in range(50):
-        capture.observe(store, "s1", tool="Edit", summary=f"edit {i} " + "x" * 200, now=float(i))
+        capture.observe(
+            store, "s1", tool="Edit",
+            summary=f"edit {i} " + "x" * 200,
+            now=float(i), config=_rt_cfg(),
+        )
     cmd = _stub_llm(tmp_path, [{"title": "t", "body": "b " * 20}])
     store.config_path.write_text(
-        "capture:\n  split:\n    threshold_observations: 3\n"
-        "    max_input_chars: 500\n"
-        f"    llm_cmd: \"{cmd}\"\n",
+        yaml.safe_dump(
+            {
+                "capture": {
+                    "split": {
+                        "threshold_observations": 3,
+                        "max_input_chars": 500,
+                        "llm_cmd": cmd,
+                    }
+                }
+            }
+        ),
         encoding="utf-8",
     )
     res = session_split.summarize(store, "s1", mode="auto")
@@ -306,7 +357,7 @@ def test_summarize_returns_webapp_keys_on_split(store: KBStore, tmp_path: Path) 
 
 def test_summarize_webapp_keys_on_skip(store: KBStore) -> None:
     from vouch import capture
-    capture.observe(store, "s1", tool="Edit", summary="one", now=1.0)
+    capture.observe(store, "s1", tool="Edit", summary="one", now=1.0, config=_rt_cfg())
     res = session_split.summarize(store, "s1")
     assert res["summarized"] is False
     assert res["session_id"] == "s1"
@@ -388,19 +439,27 @@ ENRICH_JSON = (
 
 
 def _enrich_stub(tmp_path: Path, output: str = ENRICH_JSON) -> str:
-    script = tmp_path / "enrich-llm.sh"
-    script.write_text(
-        f"#!/bin/sh\ncat > /dev/null\ncat <<'JSON'\n{output}\nJSON\n",
-        encoding="utf-8",
+    """Python stub so enrich tests run without ``sh``/heredoc (Windows)."""
+    import sys
+
+    out = tmp_path / "enrich-out.json"
+    out.write_text(output, encoding="utf-8")
+    return (
+        f'{sys.executable} -c "import pathlib,sys; '
+        f'sys.stdin.read(); '
+        f'sys.stdout.write(pathlib.Path(r\'{out}\').read_text(encoding=\'utf-8\'))"'
     )
-    return f"sh {script}"
 
 
 def test_mechanical_page_enriched(store: KBStore, tmp_path: Path) -> None:
+    import yaml
+
     from vouch.models import ProposalStatus
 
     store.config_path.write_text(
-        f'capture:\n  enrich:\n    llm_cmd: "{_enrich_stub(tmp_path)}"\n',
+        yaml.safe_dump(
+            {"capture": {"enrich": {"llm_cmd": _enrich_stub(tmp_path)}}}
+        ),
         encoding="utf-8",
     )
     _observe(store, "s1", 5)
@@ -439,10 +498,20 @@ def test_enrichment_failure_files_plain_page(store: KBStore, tmp_path: Path) -> 
 def test_split_failure_fallback_skips_enrichment(store: KBStore, tmp_path: Path) -> None:
     # split forced on and broken; a working enrich cmd must NOT be attempted
     # on the fallback path (the LLM already failed once this run).
+    import yaml
+
     store.config_path.write_text(
-        "capture:\n"
-        '  split:\n    threshold_observations: 3\n    llm_cmd: "false"\n'
-        f'  enrich:\n    llm_cmd: "{_enrich_stub(tmp_path)}"\n',
+        yaml.safe_dump(
+            {
+                "capture": {
+                    "split": {
+                        "threshold_observations": 3,
+                        "llm_cmd": "false",
+                    },
+                    "enrich": {"llm_cmd": _enrich_stub(tmp_path)},
+                }
+            }
+        ),
         encoding="utf-8",
     )
     _observe(store, "s1", 5)

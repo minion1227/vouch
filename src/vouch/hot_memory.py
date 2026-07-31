@@ -134,6 +134,7 @@ HOT_MEMORY_COVERED: frozenset[str] = frozenset({
     "kb.list_relations",
     "kb.list_sources",
     "kb.list_pending",
+    "kb.list_goals",
 })
 
 # Explicit exclusions for ``test_hot_memory_universal_coverage``.
@@ -170,6 +171,8 @@ HOT_MEMORY_EXCLUDED: dict[str, str] = {
     "kb.propose_relation": "write path — review gate",
     "kb.propose_theme": "write path — review gate",
     "kb.propose_delete": "write path — review gate",
+    "kb.propose_goal": "write path — review gate",
+    "kb.set_goal_status": "lifecycle — mutates durable state",
     "kb.compile": "write path — review gate (files page proposals via wiki-compiler)",
     "kb.summarize_session": "write path — review gate (files session-summary page proposals)",
     "kb.clear_claims": "lifecycle — mutates durable state",
@@ -188,6 +191,9 @@ HOT_MEMORY_EXCLUDED: dict[str, str] = {
     "kb.session_end": "session control — not a KB read",
     "kb.volunteer_context": "push channel — already surfaces hot claims",
     "kb.crystallize": "write path — proposal intake",
+    "kb.capture_correction": (
+        "write path — review gate (files a pending claim proposal)"
+    ),
     "kb.index_rebuild": "maintenance — mutates derived index",
     "kb.lint": "diagnostics — no claim payload",
     "kb.doctor": "diagnostics — no claim payload",
@@ -241,8 +247,21 @@ def _preview(text: str) -> str:
     return flat[: TEXT_PREVIEW_CHARS - 1] + "…"
 
 
+_RETIRED_CLAIM_STATUSES = frozenset({
+    ClaimStatus.SUPERSEDED,
+    ClaimStatus.ARCHIVED,
+    ClaimStatus.REDACTED,
+})
+
+
 def _is_active(status: ClaimStatus) -> bool:
-    return status in {ClaimStatus.WORKING, ClaimStatus.STABLE, ClaimStatus.CONTESTED}
+    # ACTIONABLE is a live post-approve state (lifecycle.confirm()'s first
+    # confirmation moves WORKING -> ACTIONABLE) — a literal WORKING/STABLE/
+    # CONTESTED set silently drops a claim from the sidebar the moment it's
+    # confirmed. Defined as the complement of the retired statuses so a
+    # future ClaimStatus addition defaults to active, matching
+    # context.py's _RETRACTED_CLAIM_STATUSES pattern.
+    return status not in _RETIRED_CLAIM_STATUSES
 
 
 def query_bias_for_page(page: Page) -> str:

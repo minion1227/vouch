@@ -29,13 +29,19 @@ import yaml
 
 from . import audit as audit_mod
 from . import llm_draft
-from .config_coerce import coerce_bool
+from .config_coerce import coerce_bool, coerce_numeric
 from .context import _RETRACTED_CLAIM_STATUSES
-from .models import ProposalStatus
+from .models import Page, PageStatus, ProposalStatus
 from .proposals import ProposalError, _slugify, propose_page
 from .storage import ArtifactNotFoundError, KBStore
 
 DEFAULT_MAX_PAGES = 5
+# Tags a claim must carry to be read as "about the operator" (#614). Explicit
+# opt-in, never inferred from prose — see build_profile_prompt.
+DEFAULT_PROFILE_TAGS: tuple[str, ...] = (
+    "preference", "convention", "decision", "correction",
+)
+PROFILE_PAGE_TITLE = "operator profile"
 DEFAULT_TIMEOUT_SECONDS = 180.0
 
 # The proposer identity for compiled drafts. Deliberately NOT the human
@@ -138,15 +144,10 @@ class CompileConfig:
     # one focused page per topic (llm-wiki's extract-then-generate shape). Off
     # by default — it doubles the LLM calls for finer-grained pages.
     two_phase: bool = False
-
-
-def _coerce(value: Any, default: Any, cast: Any) -> Any:
-    # A config typo (max_pages: five) must degrade to the default, not take
-    # down every caller — the web queue reads this config on each render.
-    try:
-        return cast(value)
-    except (TypeError, ValueError):
-        return default
+    # #614: which claims count as being about the operator, and (optionally)
+    # the entity id standing for them.
+    profile_tags: tuple[str, ...] = DEFAULT_PROFILE_TAGS
+    profile_entity: str | None = None
 
 
 def load_config(store: KBStore) -> CompileConfig:
@@ -163,15 +164,29 @@ def load_config(store: KBStore) -> CompileConfig:
     cmd = raw.get("llm_cmd")
     return CompileConfig(
         llm_cmd=str(cmd) if cmd else None,
-        max_pages=_coerce(
+        max_pages=coerce_numeric(
             raw.get("max_pages", DEFAULT_MAX_PAGES), DEFAULT_MAX_PAGES, int,
         ),
-        timeout_seconds=_coerce(
+        timeout_seconds=coerce_numeric(
             raw.get("timeout_seconds", DEFAULT_TIMEOUT_SECONDS),
             DEFAULT_TIMEOUT_SECONDS, float,
         ),
         two_phase=coerce_bool(raw.get("two_phase", False), False),
+        profile_tags=_coerce_tags(raw.get("profile_tags")),
+        profile_entity=(
+            str(raw["profile_entity"]) if raw.get("profile_entity") else None
+        ),
     )
+
+
+def _coerce_tags(value: Any) -> tuple[str, ...]:
+    """Normalise ``compile.profile_tags``; a malformed list keeps the default."""
+    if not isinstance(value, list):
+        return DEFAULT_PROFILE_TAGS
+    tags = tuple(
+        str(t).strip().lower() for t in value if str(t).strip()
+    )
+    return tags or DEFAULT_PROFILE_TAGS
 
 
 @dataclass
@@ -188,6 +203,19 @@ class CompileReport:
             "draft_count": len(self.drafts),
             "dry_run": self.dry_run,
         }
+
+
+def _live_pages(store: KBStore) -> list[Page]:
+    """Pages the wiki still has, i.e. everything but the archived ones.
+
+    Archiving is how an operator retires a bad compile page. Counting an
+    archived page as taken makes that retirement one-way: the LLM is told not
+    to redraft a topic the wiki no longer carries, and a draft that reuses the
+    title is dropped as a duplicate of a page nobody can read. Claims already
+    get this treatment via `_RETRACTED_CLAIM_STATUSES`; this is the same live
+    set recall, digest, search and the wiki view use.
+    """
+    return [p for p in store.list_pages() if p.status is not PageStatus.ARCHIVED]
 
 
 def _pending_page_names(store: KBStore) -> set[str]:
@@ -285,7 +313,7 @@ def build_prompt(
     ]
     if not claims:
         raise CompileError("nothing to compile: the KB has no live approved claims")
-    pages = store.list_pages()
+    pages = _live_pages(store)
     pending = _pending_page_names(store)
 
     lines = [
@@ -339,6 +367,167 @@ def build_prompt(
         " \"claims\": [claim-id, ...]}",
     ]
     return "\n".join(lines)
+
+
+def select_profile_claims(
+    store: KBStore, *, config: CompileConfig | None = None,
+) -> list[Any]:
+    """Live approved claims that are explicitly about the operator.
+
+    Selection is **opt-in, never inferred**. A claim qualifies by carrying one
+    of ``compile.profile_tags`` or by naming ``compile.profile_entity`` — not
+    by looking like a first-person sentence.
+
+    That restraint is the feature. The thing this page replaces is ditto's
+    personality inference over chat logs, and guessing "this sentence is about
+    you" from arbitrary prose is the same move in miniature: an unreviewed
+    inference about a person. A tag is something a human already approved.
+    """
+    cfg = config or load_config(store)
+    wanted = {t.lower() for t in cfg.profile_tags}
+    out = []
+    for claim in store.list_claims():
+        if claim.status in _RETRACTED_CLAIM_STATUSES:
+            continue
+        tagged = any(str(t).lower() in wanted for t in claim.tags)
+        named = (
+            cfg.profile_entity is not None
+            and cfg.profile_entity in claim.entities
+        )
+        if tagged or named:
+            out.append(claim)
+    return out
+
+
+def build_profile_prompt(store: KBStore, claims: list[Any]) -> str:
+    """Assemble the operator-profile prompt from pre-selected claims.
+
+    The claim set is passed in rather than re-derived so the caller (and the
+    tests) can see exactly what the model was shown — this page is about a
+    person, so what went into it should never be implicit.
+    """
+    if not claims:
+        raise CompileError(
+            "nothing to profile: no live approved claim carries a profile tag "
+            f"({', '.join(DEFAULT_PROFILE_TAGS)}). tag the claims that record "
+            "how you work, then compile again"
+        )
+    lines = [
+        "You are compiling a single page describing how this project's",
+        "operator works, for an agent starting a new session with them.",
+        "",
+        "APPROVED CLAIMS ABOUT THE OPERATOR (id: text):",
+    ]
+    lines += [f"- {c.id}: {c.text}" for c in claims]
+    lines += [
+        "",
+        "RULES",
+        "- Draft exactly ONE page titled \"" + PROFILE_PAGE_TITLE + "\".",
+        "- Report only what the claims state. Do NOT infer personality, traits,",
+        "  temperament, or any psychometric category (big five, mbti, disc).",
+        "  There is no claim that could support one, so any such sentence would",
+        "  be uncited and dropped.",
+        "- Write cited behavioural statements: what they prefer, the",
+        "  conventions they hold, decisions already made, corrections already",
+        "  given.",
+        "- Every substantive sentence MUST end with [claim: <claim-id>] using",
+        "  ONLY ids from the list above. Uncited prose is dropped.",
+        "- Structure with markdown \"##\" sections: Preferences / Conventions /",
+        "  Decisions / Corrections. Omit a section with no claims behind it.",
+        "- Give a one-line \"summary\" (<= 25 words) and 3-6 lowercase \"tags\".",
+        "",
+        "OUTPUT: print ONLY a JSON array with exactly one element, no code",
+        "fences, no commentary. The element:",
+        " {\"title\": str, \"type\": \"concept\", \"summary\": str,",
+        "  \"tags\": [str, ...], \"body\": str, \"claims\": [claim-id, ...]}",
+    ]
+    return "\n".join(lines)
+
+
+def compile_profile(
+    store: KBStore,
+    *,
+    actor: str = COMPILE_ACTOR,
+    triggered_by: str | None = None,
+    llm_cmd: str | None = None,
+    dry_run: bool = False,
+    session_id: str | None = None,
+    config: CompileConfig | None = None,
+) -> CompileReport:
+    """Draft the operator-profile page and file it as a proposal.
+
+    Lands PENDING like any other page: a human reads what the system thinks it
+    knows about them and says yes or no. That review step *is* the feature —
+    it is what separates this from inferring a profile and acting on it.
+
+    A refresh re-proposes rather than rewriting, so the history of what the
+    system believed about you stays auditable instead of being silently
+    mutated in place.
+    """
+    cfg = config or load_config(store)
+    cmd = llm_cmd or cfg.llm_cmd
+    if not cmd:
+        raise CompileError(
+            "compile.llm_cmd is not configured — set it in .vouch/config.yaml, "
+            "e.g.\ncompile:\n  llm_cmd: \"claude -p --model sonnet\""
+        )
+
+    claims = select_profile_claims(store, config=cfg)
+    prompt = build_profile_prompt(store, claims)
+    drafts = parse_drafts(run_llm(cmd, prompt, timeout_seconds=cfg.timeout_seconds))
+    report = CompileReport(drafts=drafts, dry_run=dry_run)
+
+    allowed = {c.id for c in claims}
+    for draft in drafts[:1]:
+        title = str(draft.get("title") or PROFILE_PAGE_TITLE).strip()
+        body = str(draft.get("body") or "").strip()
+        reason = _low_coverage_reason(body)
+        if reason is not None:
+            report.dropped.append({"title": title, "reason": reason})
+            continue
+        # A profile page may only cite the claims it was shown. Without this a
+        # model could pull in an unrelated claim id and the page would assert
+        # something about the operator that was never selected for it.
+        stray = [
+            str(c) for c in (draft.get("claims") or []) if str(c) not in allowed
+        ]
+        if stray:
+            report.dropped.append({
+                "title": title,
+                "reason": f"cites claims outside the profile set: {', '.join(stray)}",
+            })
+            continue
+        if dry_run:
+            report.proposed.append({"title": title, "proposal_id": "(dry-run)"})
+            continue
+        page_tags, page_meta = _page_frontmatter(draft)
+        try:
+            proposal = propose_page(
+                store,
+                title=title,
+                body=body,
+                page_type="concept",
+                claim_ids=[str(c) for c in draft.get("claims") or []],
+                proposed_by=actor,
+                tags=page_tags,
+                metadata=page_meta or None,
+                session_id=session_id,
+                rationale="compiled from approved claims tagged as operator "
+                          "profile material; no inference beyond what is cited",
+            )
+        except ProposalError as e:
+            report.dropped.append({"title": title, "reason": str(e)})
+            continue
+        report.proposed.append({
+            "title": title, "proposal_id": proposal.id,
+        })
+
+    audit_mod.log_event(
+        store.kb_dir, event="compile.profile", actor=triggered_by or actor,
+        data={"claims": len(claims), "proposed": len(report.proposed)},
+        dry_run=dry_run,
+    )
+    return report
 
 
 def run_llm(llm_cmd: str, prompt: str, *, timeout_seconds: float) -> str:
@@ -472,7 +661,7 @@ def compile_kb(
 
     report = CompileReport(drafts=drafts, dry_run=dry_run)
 
-    existing = store.list_pages()
+    existing = _live_pages(store)
     taken_names = {p.title.strip().lower() for p in existing}
     taken_names |= {p.id.strip().lower() for p in existing}
     taken_names |= _pending_page_names(store)
